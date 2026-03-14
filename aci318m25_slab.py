@@ -238,55 +238,64 @@ class ACI318M25SlabDesign:
     def calculate_slab_moments_two_way(self, geometry: SlabGeometry,
                                      loads: SlabLoads) -> SlabMoments:
         """
-        Calculate moments for two-way slabs using Direct Design Method
+        Calculate moments for two-way slabs using Direct Design Method approximations
         ACI 318M-25 Section 8.10
         
-        Args:
-            geometry: Slab geometric properties
-            loads: Loading conditions
-            
-        Returns:
-            Slab moments
+        Note: This calculates the governing (column strip) moments per meter width
+        to ensure the most critical sections are safely reinforced.
         """
-        # Total factored load
+        # Total factored load (wu) in kN/m²
         wu = (loads.dead_load + loads.superimposed_dead) * loads.load_factors.get('D', 1.4) + \
              loads.live_load * loads.load_factors.get('L', 1.6)
         
-        # Convert dimensions to meters for moment calculation
-        lx = min(geometry.length_x, geometry.length_y) / 1000  # Convert mm to m
-        ly = max(geometry.length_x, geometry.length_y) / 1000  # Convert mm to m
+        # Convert dimensions to meters
+        lx = geometry.length_x / 1000
+        ly = geometry.length_y / 1000
         
-        # Aspect ratio
-        beta = ly / lx
+        # Assume standard 300mm column/support widths for clear span calculation (ln)
+        # ACI 318 limits clear span to not less than 65% of center-to-center span
+        ln_x = max(lx - 0.300, 0.65 * lx)
+        ln_y = max(ly - 0.300, 0.65 * ly)
         
-        # Two-way action coefficients (simplified)
-        if beta <= 1.5:
-            # Square or nearly square panels
-            alpha_x = 0.5
-            alpha_y = 0.5
-        elif beta <= 2.0:
-            alpha_x = 0.6
-            alpha_y = 0.4
+        # Total static moment in each direction (Mo) - ACI 318M-25 Eq. (8.10.3.2)
+        # Mo = wu * l2 * ln^2 / 8
+        Mo_x = wu * ly * (ln_x ** 2) / 8  # Design span is x, transverse width is y
+        Mo_y = wu * lx * (ln_y ** 2) / 8  # Design span is y, transverse width is x
+        
+        # Distribution factors for interior vs exterior spans (Simplified)
+        # If any support is simply supported, treat as an exterior panel without edge beams
+        supports = list(geometry.support_conditions.values())
+        if SupportCondition.SIMPLY_SUPPORTED in supports:
+            # Exterior panel approximation
+            neg_factor = 0.70  # Interior negative
+            pos_factor = 0.52  # Positive
         else:
-            # Approaches one-way action
-            alpha_x = 0.8
-            alpha_y = 0.2
+            # Interior panel - ACI 318M-25 Sec 8.10.4.1
+            neg_factor = 0.65
+            pos_factor = 0.35
+            
+        # Total positive and negative moments per panel
+        M_neg_x_total = neg_factor * Mo_x
+        M_pos_x_total = pos_factor * Mo_x
         
-        # Total static moment for each direction (now in kN⋅m)
-        # Formula: Mo = wu * l1 * l2^2 / 8 (where wu in kN/m², l1,l2 in m)
-        Mo_x = wu * lx * ly**2 / 8  # kN⋅m
-        Mo_y = wu * ly * lx**2 / 8  # kN⋅m
+        M_neg_y_total = neg_factor * Mo_y
+        M_pos_y_total = pos_factor * Mo_y
         
-        # Distribute moments to positive and negative regions
-        # Simplified distribution (detailed coefficients in ACI 318M-25)
-        moment_x_positive = 0.35 * Mo_x * alpha_x
-        moment_x_negative = 0.65 * Mo_x * alpha_x
-        moment_y_positive = 0.35 * Mo_y * alpha_y
-        moment_y_negative = 0.65 * Mo_y * alpha_y
+        # Convert to critical moments per meter width (Column Strip)
+        # Column strip width is 0.5 * min(lx, ly) per ACI 318
+        cs_width = 0.5 * min(lx, ly)
         
-        # Shear forces (kN/m)
-        shear_x = wu * ly / 2  # kN/m (wu in kN/m², ly in m → kN/m)
-        shear_y = wu * lx / 2  # kN/m (wu in kN/m², lx in m → kN/m)
+        # ACI 318 Sec 8.10.5: Column strips take ~75% of negative moment and ~60% of positive moment
+        moment_x_negative = (0.75 * M_neg_x_total) / cs_width
+        moment_x_positive = (0.60 * M_pos_x_total) / cs_width
+        
+        moment_y_negative = (0.75 * M_neg_y_total) / cs_width
+        moment_y_positive = (0.60 * M_pos_y_total) / cs_width
+        
+        # Shear forces per meter width (governing edge)
+        # Uses clear span for critical shear calculations
+        shear_x = wu * ln_x / 2
+        shear_y = wu * ln_y / 2
         
         return SlabMoments(
             moment_x_positive=moment_x_positive,
@@ -298,65 +307,44 @@ class ACI318M25SlabDesign:
         )
     
     def design_flexural_reinforcement(self, moment: float, width: float,
-                                    effective_depth: float,
-                                    material_props: MaterialProperties) -> Tuple[str, float]:
-        """
-        Design flexural reinforcement for slab
-        ACI 318M-25 Chapter 9
-        
-        Args:
-            moment: Factored moment per unit width (kN⋅m/m)
-            width: Design width (typically 1000mm for slabs)
-            effective_depth: Effective depth (mm)
-            material_props: Material properties
-            
-        Returns:
-            Tuple of (bar_size, spacing_mm)
-        """
+                                      effective_depth: float, thickness: float, cover: float,
+                                      material_props: MaterialProperties) -> Tuple[str, float]:
+        """Design flexural reinforcement for slab"""
         fc_prime = material_props.fc_prime
         fy = material_props.fy
         b = width
         d = effective_depth
         
-        # Convert moment to N⋅mm
         Mu = moment * 1e6
         
         if Mu <= 0:
-            # Minimum reinforcement only
-            return self._design_minimum_reinforcement(b, d, fy)
+            return self._design_minimum_reinforcement(b, thickness, fy, cover)
         
         phi = self.phi_factors['flexure']
         
-        # Calculate required reinforcement area
-        # Using quadratic formula: Mu = φ * As * fy * (d - a/2)
-        # where a = As * fy / (0.85 * fc_prime * b)
-        
         A = phi * fy**2 / (2 * 0.85 * fc_prime * b)
-        B = phi * fy * d
-        C = -Mu
+        B = -phi * fy * d  
+        C = Mu             
         
         discriminant = B**2 - 4*A*C
         if discriminant < 0:
             raise ValueError("Section inadequate for applied moment")
         
-        As_required = (-B + math.sqrt(discriminant)) / (2*A)
+        As_required = (-B - math.sqrt(discriminant)) / (2*A)
         
-        # Check minimum reinforcement
-        As_min = self._calculate_minimum_slab_reinforcement(b, d, fy)
+        # Updated call to pass 'thickness' instead of 'effective_depth'
+        As_min = self._calculate_minimum_slab_reinforcement(b, thickness, fy)
         As_required = max(As_required, As_min)
         
-        # Check maximum reinforcement (temperature and shrinkage controls)
-        As_max = 0.025 * b * d  # Practical maximum
+        As_max = 0.025 * b * d
         if As_required > As_max:
             raise ValueError("Required reinforcement exceeds practical maximum")
         
-        # Select bar size and spacing
-        return self._select_slab_reinforcement(As_required, b)
+        return self._select_slab_reinforcement(As_required, b, fy, thickness, cover)
     
     def _design_minimum_reinforcement(self, width: float, thickness: float,
-                                    fy: float) -> Tuple[str, float]:
+                                      fy: float, cover: float) -> Tuple[str, float]:
         """Design minimum reinforcement for slabs"""
-        # Minimum reinforcement for shrinkage and temperature - ACI 318M-25 Section 7.12
         if fy <= 420:
             rho_min = 0.0020
         elif fy <= 520:
@@ -365,47 +353,60 @@ class ACI318M25SlabDesign:
             rho_min = 0.0018 * 420 / fy
         
         As_min = rho_min * width * thickness
-        
-        return self._select_slab_reinforcement(As_min, width)
+        return self._select_slab_reinforcement(As_min, width, fy, thickness, cover)
     
     def _calculate_minimum_slab_reinforcement(self, width: float, 
-                                            effective_depth: float,
+                                            thickness: float,
                                             fy: float) -> float:
-        """Calculate minimum flexural reinforcement for slabs"""
-        # Minimum flexural reinforcement
-        As_min_flexure = 1.4 * width * effective_depth / fy
-        
-        # Minimum shrinkage and temperature reinforcement
+        """Calculate minimum flexural reinforcement for slabs (shrinkage and temperature limit)"""
+        # Minimum shrinkage and temperature reinforcement per ACI 318M-25 Section 24.4
         if fy <= 420:
             rho_temp = 0.0020
         elif fy <= 520:
             rho_temp = 0.0018
         else:
-            rho_temp = 0.0018 * 420 / fy
+            rho_temp = 0.0018 * 420.0 / fy
         
-        As_min_temp = rho_temp * width * effective_depth
+        # For slabs, minimum flexural reinforcement is governed by gross area
+        As_min_temp = rho_temp * width * thickness
         
-        return max(As_min_flexure, As_min_temp)
+        return As_min_temp
     
-    def _select_slab_reinforcement(self, As_required: float, 
-                                 width: float) -> Tuple[str, float]:
-        """Select appropriate bar size and spacing for slab"""
+    def _select_slab_reinforcement(self, As_required: float, width: float,
+                                   fy: float, thickness: float, cover: float,
+                                   aggregate_size: float = 25.0) -> Tuple[str, float]:
+        """Select appropriate bar size and spacing for slab considering ACI 318M-25 limits"""
         # Common slab bar sizes
-        bar_sizes = ['10M', '15M', '20M', '25M']
+        bar_sizes = ['D10', 'D12', 'D16', 'D20']
+        
+        # Calculate maximum spacing for crack control (ACI 318M-25 Sec. 24.3.2)
+        fs = (2.0 / 3.0) * fy
+        s_limit_1 = 380 * (280 / fs) - 2.5 * cover
+        s_limit_2 = 300 * (280 / fs)
+        max_crack_spacing = min(s_limit_1, s_limit_2)
+        
+        # General slab maximum spacing limit (ACI 318M-25 Sec. 7.7.2.3 / 8.7.2.2)
+        max_general_spacing = min(3 * thickness, 450.0)
+        
+        # Governing maximum spacing
+        max_spacing = min(max_crack_spacing, max_general_spacing)
         
         for bar_size in bar_sizes:
             bar_area = self.aci.get_bar_area(bar_size)
+            db = self.aci.get_bar_diameter(bar_size)
+            
+            # Theoretical required spacing to meet area
             spacing = bar_area * width / As_required
             
-            # Check spacing limits
-            max_spacing = min(3 * 200, 450)  # Assume 200mm slab thickness
-            min_spacing = max(bar_area / 25, 75)  # Minimum practical spacing
+            # Minimum clear spacing (ACI 318M-25 Sec. 25.2.1)
+            min_clear_spacing = max(25.0, db, (4.0/3.0) * aggregate_size)
+            min_c2c_spacing = min_clear_spacing + db
             
-            if min_spacing <= spacing <= max_spacing:
+            if min_c2c_spacing <= spacing <= max_spacing:
                 return bar_size, spacing
         
-        # If no suitable single size, use smallest bar with maximum spacing
-        bar_size = '15M'
+        # If no suitable single size fits perfectly, use smallest bar with maximum allowable spacing
+        bar_size = 'D10'
         bar_area = self.aci.get_bar_area(bar_size)
         spacing = min(max_spacing, bar_area * width / As_required)
         
@@ -415,51 +416,35 @@ class ACI318M25SlabDesign:
                            material_props: MaterialProperties,
                            column_dimensions: Tuple[float, float],
                            punching_force: float) -> Tuple[bool, float]:
-        """
-        Check punching shear around columns
-        ACI 318M-25 Section 22.6
-        
-        Args:
-            geometry: Slab geometric properties
-            material_props: Material properties
-            column_dimensions: (width, depth) of column (mm)
-            punching_force: Factored punching force (kN)
-            
-        Returns:
-            Tuple of (is_adequate, utilization_ratio)
-        """
+        """Check punching shear around columns - ACI 318M-25 Section 22.6"""
         fc_prime = material_props.fc_prime
         d = min(geometry.effective_depth_x, geometry.effective_depth_y)
         
         col_width, col_depth = column_dimensions
         
-        # Critical section perimeter at d/2 from column face
+        # Calculate true beta for rectangular columns
+        col_max = max(col_width, col_depth)
+        col_min = min(col_width, col_depth)
+        beta = col_max / col_min if col_min > 0 else 1.0
+        
         bo = 2 * (col_width + d) + 2 * (col_depth + d)
         
-        # Punching shear strength - ACI 318M-25 Section 22.6.5.2
-        # Three controlling equations:
+        # Equation 1: Basic punching shear (Now using true beta)
+        vc1 = 0.17 * (1 + 2/beta) * math.sqrt(fc_prime)
         
-        # Equation 1: Basic punching shear
-        vc1 = 0.17 * (1 + 2/1) * math.sqrt(fc_prime)  # Assume β = 1 (square column)
-        
-        # Equation 2: Based on column location (interior column)
-        alphas = 40  # For interior columns
+        # Equation 2: Based on column location (Assuming interior alphas = 40)
+        alphas = 40  
         vc2 = 0.083 * (alphas * d / bo + 2) * math.sqrt(fc_prime)
         
         # Equation 3: Maximum punching shear
         vc3 = 0.33 * math.sqrt(fc_prime)
         
-        # Controlling punching shear strength
         vc = min(vc1, vc2, vc3)
-        
-        # Nominal punching shear capacity
         Vn = vc * bo * d / 1000  # Convert to kN
         
-        # Design punching shear capacity
         phi = self.phi_factors['shear']
         phi_Vn = phi * Vn
         
-        # Check adequacy
         is_adequate = punching_force <= phi_Vn
         utilization_ratio = punching_force / phi_Vn if phi_Vn > 0 else float('inf')
         
@@ -470,75 +455,54 @@ class ACI318M25SlabDesign:
                            service_loads: SlabLoads,
                            reinforcement_x: float,
                            reinforcement_y: float) -> float:
-        """
-        Calculate slab deflection
-        ACI 318M-25 Chapter 24
-        
-        Args:
-            geometry: Slab geometric properties
-            material_props: Material properties
-            service_loads: Service load conditions
-            reinforcement_x: Reinforcement area in x-direction (mm²/m)
-            reinforcement_y: Reinforcement area in y-direction (mm²/m)
-            
-        Returns:
-            Maximum deflection (mm)
-        """
-        # Service load
+        """Calculate slab deflection - ACI 318M-25 Chapter 24"""
         w_service = service_loads.dead_load + service_loads.superimposed_dead + service_loads.live_load
         
-        # Material properties
+        # Convert load from kN/m² to N/mm for a 1000mm strip width
+        w_service_n_mm = w_service / 1000.0  
+        
         Ec = material_props.ec
         fc_prime = material_props.fc_prime
-        
-        # Slab properties
         h = geometry.thickness
-        lx = min(geometry.length_x, geometry.length_y)
-        ly = max(geometry.length_x, geometry.length_y)
+        lx_mm = min(geometry.length_x, geometry.length_y)
+        lx_m = lx_mm / 1000.0
         
-        # Gross moment of inertia per unit width
-        Ig = h**3 / 12  # mm⁴/mm
-        
-        # Modulus of rupture
+        # Enforce consistent 1000 mm strip width
+        b = 1000.0
+        Ig = (b * h**3) / 12.0
         fr = 0.62 * math.sqrt(fc_prime)
         
-        # Cracking moment per unit width
-        Mcr = fr * Ig / (h/2) / 1000  # kN⋅m/m
+        # Cracking moment in N⋅mm
+        Mcr_n_mm = fr * Ig / (h / 2.0) 
         
-        # Service moment (simplified for uniformly loaded slab)
+        # Service moment calculation (yields kN⋅m, convert to N⋅mm)
         if geometry.slab_type == SlabType.ONE_WAY:
-            M_service = w_service * lx**2 / 8
+            M_service_kn_m = w_service * (lx_m**2) / 8.0
         else:
-            # Two-way slab approximation
-            M_service = w_service * lx**2 / 16
+            M_service_kn_m = w_service * (lx_m**2) / 16.0
+            
+        M_service_n_mm = M_service_kn_m * 1e6
         
-        # Transform section properties
-        n = 200000 / Ec  # Modular ratio
-        As = max(reinforcement_x, reinforcement_y)  # Use larger reinforcement
-        rho = As / (1000 * geometry.effective_depth_x)
-        
-        # Neutral axis depth (cracked section)
-        k = math.sqrt(2 * rho * n + (rho * n)**2) - rho * n
-        
-        # Cracked moment of inertia per unit width
+        n = 200000.0 / Ec
+        As = max(reinforcement_x, reinforcement_y)
         d = geometry.effective_depth_x
-        Icr = (1000 * k**3 * d**3) / 3 + n * As * (d * (1 - k))**2
+        rho = As / (b * d)
         
-        # Effective moment of inertia
-        if M_service <= Mcr:
+        k = math.sqrt(2 * rho * n + (rho * n)**2) - rho * n
+        Icr = (b * k**3 * d**3) / 3.0 + n * As * (d * (1.0 - k))**2
+        
+        if M_service_n_mm <= Mcr_n_mm:
             Ie = Ig
         else:
-            Ie = (Mcr / M_service)**3 * Ig + (1 - (Mcr / M_service)**3) * Icr
+            Ie = (Mcr_n_mm / M_service_n_mm)**3 * Ig + (1.0 - (Mcr_n_mm / M_service_n_mm)**3) * Icr
             Ie = max(Ie, Icr)
         
-        # Deflection calculation (simplified for center of slab)
+        # Deflection using consistent N, mm, MPa units
         if geometry.slab_type == SlabType.ONE_WAY:
-            # One-way slab deflection
-            deflection = 5 * w_service * lx**4 / (384 * Ec * Ie)
+            deflection = 5.0 * w_service_n_mm * (lx_mm**4) / (384.0 * Ec * Ie)
         else:
-            # Two-way slab deflection (approximate)
-            alpha = 0.001  # Deflection coefficient for two-way slabs
-            deflection = alpha * w_service * lx**4 / (Ec * Ie)
+            alpha = 0.001 
+            deflection = alpha * w_service_n_mm * (lx_mm**4) / (Ec * Ie)
         
         return deflection
     
@@ -573,26 +537,26 @@ class ACI318M25SlabDesign:
         
         # Design reinforcement
         bar_x, spacing_x = self.design_flexural_reinforcement(
-            moments.moment_x_positive, 1000, geometry.effective_depth_x, material_props
+            moments.moment_x_positive, 1000, geometry.effective_depth_x, geometry.thickness, geometry.cover, material_props
         )
         
         bar_y, spacing_y = self.design_flexural_reinforcement(
-            moments.moment_y_positive, 1000, geometry.effective_depth_y, material_props
+            moments.moment_y_positive, 1000, geometry.effective_depth_y, geometry.thickness, geometry.cover, material_props
         )
         
         # Top reinforcement for negative moments
         if moments.moment_x_negative > 0:
             bar_top, spacing_top = self.design_flexural_reinforcement(
-                moments.moment_x_negative, 1000, geometry.effective_depth_x, material_props
+                moments.moment_x_negative, 1000, geometry.effective_depth_x, geometry.thickness, geometry.cover, material_props
             )
         else:
             bar_top, spacing_top = self._design_minimum_reinforcement(
-                1000, geometry.thickness, material_props.fy
+                1000, geometry.thickness, material_props.fy, geometry.cover
             )
         
         # Shrinkage and temperature reinforcement
         bar_shrink, spacing_shrink = self._design_minimum_reinforcement(
-            1000, geometry.thickness, material_props.fy
+            1000, geometry.thickness, material_props.fy, geometry.cover
         )
         
         # Calculate reinforcement areas
@@ -636,7 +600,9 @@ class ACI318M25SlabDesign:
             moments.moment_y_positive / (As_y * material_props.fy * geometry.effective_depth_y * 0.9 / 1e6)
         ) if As_x > 0 and As_y > 0 else 0
         
-        utilization_ratio = min(moment_utilization, 1.0)
+        # FIXED: Actually incorporate punching shear into the utilization and remove the 1.0 clamp!
+        punch_utilization = punch_ratio if 'punch_ratio' in locals() else 0.0
+        utilization_ratio = max(moment_utilization, punch_utilization)
         
         # Create result objects
         reinforcement = SlabReinforcement(

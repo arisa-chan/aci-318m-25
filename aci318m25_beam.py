@@ -57,12 +57,16 @@ class ReinforcementDesign:
     stirrups: str             # Stirrup bar size
     stirrup_spacing: float    # Stirrup spacing (mm)
     development_length: float # Development length (mm)
+    # --- New Torsion Fields ---
+    torsion_longitudinal_area: float = 0.0 # Required additional longitudinal steel for torsion (mm²)
+    torsion_required: bool = False    # Flag indicating if torsion design was required
 
 @dataclass
 class BeamAnalysisResult:
     """Complete beam analysis results"""
     moment_capacity: float     # Nominal moment capacity Mn (kN⋅m)
     shear_capacity: float      # Nominal shear capacity Vn (kN)
+    torsion_capacity: float    # Nominal torsion capacity Tn (kN⋅m)
     deflection: float          # Maximum deflection (mm)
     crack_width: float         # Maximum crack width (mm)
     reinforcement: ReinforcementDesign
@@ -177,18 +181,10 @@ class ACI318M25BeamDesign:
             Maximum reinforcement ratio for tension-controlled sections
         """
         # Material properties
-        Es = 200000.0  # Steel modulus (MPa)
         beta1 = self._calculate_beta1(fc_prime)
         
-        # Strain limits for tension-controlled sections
-        epsilon_t_min = 0.005  # Minimum tensile strain for tension-controlled
-        epsilon_cu = 0.003     # Ultimate concrete strain
-        
-        # Balanced reinforcement ratio
-        rho_b = (0.85 * fc_prime * beta1 / fy) * (epsilon_cu / (epsilon_cu + epsilon_t_min))
-        
-        # Maximum reinforcement ratio (75% of balanced for tension-controlled)
-        rho_max = 0.75 * rho_b
+        # Maximum reinforcement ratio
+        rho_max = 3/8 * 0.85 * fc_prime * beta1 / fy
         
         return rho_max
     
@@ -243,30 +239,33 @@ class ACI318M25BeamDesign:
         
         phi = self.phi_factors['flexure_tension_controlled']
         
-        # Calculate required reinforcement area
-        # Mu = φ * As * fy * (d - a/2)
-        # a = As * fy / (0.85 * fc_prime * b)
-        
-        # Quadratic equation coefficients
-        # φ * As * fy * d - φ * As² * fy² / (2 * 0.85 * fc_prime * b) = Mu
+        # Corrected Quadratic equation coefficients
         A = phi * fy**2 / (2 * 0.85 * fc_prime * b)
-        B = phi * fy * d
-        C = -Mu
+        B = -phi * fy * d  # Must be negative
+        C = Mu             # Must be positive
         
-        # Solve quadratic equation
+        # Solve quadratic equation (using the negative root for the physically valid tension-controlled state)
         discriminant = B**2 - 4*A*C
-        As_required = (-B + math.sqrt(discriminant)) / (2*A)
+        if discriminant < 0:
+            raise ValueError("Section inadequate for applied moment")
+            
+        As_required = (-B - math.sqrt(discriminant)) / (2*A)
         
         # Check minimum reinforcement
         rho_min = self.calculate_minimum_reinforcement_ratio(fc_prime, fy)
         As_min = rho_min * b * d
         As_required = max(As_required, As_min)
         
-        # Select reinforcement bars
-        main_bars = self._select_reinforcement_bars(As_required)
+        # Select reinforcement bars considering spacing limits
+        main_bars = self._select_reinforcement_bars(
+            As_required, 
+            beam_geometry, 
+            fy, 
+            stirrup_size='D10'
+        )
         
         # Calculate development length
-        main_bar_size = main_bars[0] if main_bars else '20M'
+        main_bar_size = main_bars[0] if main_bars else 'D20'
         ld = self.aci.calculate_development_length(main_bar_size, fc_prime, fy)
         
         return ReinforcementDesign(
@@ -274,8 +273,8 @@ class ACI318M25BeamDesign:
             main_area=As_required,
             compression_bars=[],
             compression_area=0.0,
-            stirrups='10M',  # Default stirrup size
-            stirrup_spacing=200.0,  # Default spacing
+            stirrups='D10',  
+            stirrup_spacing=200.0,  
             development_length=ld
         )
     
@@ -284,6 +283,7 @@ class ACI318M25BeamDesign:
         """Design doubly reinforced section with compression reinforcement"""
         fc_prime = material_props.fc_prime
         fy = material_props.fy
+        es = material_props.es
         b = beam_geometry.width
         d = beam_geometry.effective_depth
         d_prime = beam_geometry.cover + 20  # Assume 20mm to center of compression bars
@@ -301,20 +301,46 @@ class ACI318M25BeamDesign:
         # Additional moment requiring compression reinforcement
         Mu2 = Mu - phi * Mn1
         
-        # Design compression reinforcement
-        # Assume compression steel yields
-        As2_prime = Mu2 / (phi * fy * (d - d_prime))
-        As2 = As2_prime  # Additional tension reinforcement to balance As2_prime
+        # Calculate actual stress in compression steel (fs')
+        beta1 = self._calculate_beta1(fc_prime)
+        c = a1 / beta1  # Depth to neutral axis
+        
+        # Strain in compression steel
+        epsilon_s_prime = 0.003 * (c - d_prime) / c
+        
+        # Actual stress in compression steel (bounded by yield strength)
+        fs_prime = max(0.0, min(epsilon_s_prime * es, fy))
+        
+        if fs_prime == 0.0:
+            # If fs' is 0 or negative, the steel is at or below the neutral axis (in tension). 
+            # The section dimensions are too small.
+            raise ValueError("Compression steel is in the tension zone. Section must be resized.")
+        
+        # Design compression reinforcement using actual stress
+        As2_prime = Mu2 / (phi * fs_prime * (d - d_prime))
+        
+        # Additional tension steel to balance compression steel
+        As2 = As2_prime * (fs_prime / fy)  
         
         # Total tension reinforcement
         As_total = As1 + As2
         
-        # Select reinforcement
-        main_bars = self._select_reinforcement_bars(As_total)
-        comp_bars = self._select_reinforcement_bars(As2_prime)
+        # Select reinforcement considering spacing limits
+        main_bars = self._select_reinforcement_bars(
+            As_total, 
+            beam_geometry, 
+            fy, 
+            stirrup_size='D10'
+        )
+        comp_bars = self._select_reinforcement_bars(
+            As2_prime, 
+            beam_geometry, 
+            fy, 
+            stirrup_size='D10'
+        )
         
         # Development length
-        main_bar_size = main_bars[0] if main_bars else '25M'
+        main_bar_size = main_bars[0] if main_bars else 'D25'
         ld = self.aci.calculate_development_length(main_bar_size, fc_prime, fy)
         
         return ReinforcementDesign(
@@ -322,8 +348,8 @@ class ACI318M25BeamDesign:
             main_area=As_total,
             compression_bars=comp_bars,
             compression_area=As2_prime,
-            stirrups='10M',
-            stirrup_spacing=150.0,  # Closer spacing for doubly reinforced
+            stirrups='D10',
+            stirrup_spacing=150.0,
             development_length=ld
         )
     
@@ -364,57 +390,237 @@ class ACI318M25BeamDesign:
             return 'None', 0.0
         elif Vu <= phi_Vc:
             # Minimum shear reinforcement required
-            return self._design_minimum_stirrups(beam_geometry, fy)
+            return self._design_minimum_stirrups(beam_geometry, material_props) # <-- Updated
         else:
             # Calculate required stirrup area
             Vs_required = Vu / phi_v - Vc  # Required shear from stirrups
-            return self._design_stirrups_for_shear(Vs_required, beam_geometry, fy)
+            return self._design_stirrups_for_shear(Vs_required, beam_geometry, material_props) # <-- Updated
     
-    def _design_minimum_stirrups(self, beam_geometry: BeamGeometry, fy: float) -> Tuple[str, float]:
+    def _design_minimum_stirrups(self, beam_geometry: BeamGeometry, material_props: MaterialProperties,
+                                 vu: float = 0.0) -> Tuple[str, float]:
         """Design minimum stirrups - ACI 318M-25 Section 9.7.6.2.2"""
         b = beam_geometry.width
+        d = beam_geometry.effective_depth
+        fc_prime = material_props.fc_prime
+        fy = material_props.fy
         
-        # Minimum stirrup area: Av,min = 0.062√fc' bw s / fy (but not less than 0.35 bw s / fy)
-        fc_prime = 28.0  # Assume typical strength for minimum calculation
-        Av_min_1 = 0.062 * math.sqrt(fc_prime) * b / fy  # mm²/mm
-        Av_min_2 = 0.35 * b / fy  # mm²/mm
+        # Minimum stirrup area
+        Av_min_1 = 0.062 * math.sqrt(fc_prime) * b / fy
+        Av_min_2 = 0.35 * b / fy
         Av_min = max(Av_min_1, Av_min_2)
         
         # Select stirrup size and calculate spacing
-        stirrup_size = '10M'
+        stirrup_size = 'D10'
         Av_stirrup = 2 * self.aci.get_bar_area(stirrup_size)  # Two legs
-        s_max = Av_stirrup / Av_min
+        s_max_calc = Av_stirrup / Av_min
         
-        # Maximum spacing limits
-        s_max_limit = min(beam_geometry.effective_depth / 2, 600.0)
-        s_actual = min(s_max, s_max_limit)
+        # Defensive high shear threshold check
+        Vu = vu * 1000  # Convert to N
+        phi_v = self.phi_factors['shear']
+        Vc = 0.17 * math.sqrt(fc_prime) * b * d
+        Vs_required = max(0.0, (Vu / phi_v) - Vc)
+        Vs_threshold = 0.33 * math.sqrt(fc_prime) * b * d
+        
+        if Vs_required > Vs_threshold:
+            s_max_limit = min(d / 4, 300.0)
+        else:
+            s_max_limit = min(d / 2, 600.0)
+            
+        s_actual = min(s_max_calc, s_max_limit)
         
         return stirrup_size, s_actual
     
     def _design_stirrups_for_shear(self, Vs_required: float, beam_geometry: BeamGeometry,
-                                 fy: float) -> Tuple[str, float]:
+                                 material_props: MaterialProperties) -> Tuple[str, float]:
         """Design stirrups for required shear strength"""
         d = beam_geometry.effective_depth
+        bw = beam_geometry.width
+        fc_prime = material_props.fc_prime
+        fy = material_props.fy
         
         # Select stirrup size
-        stirrup_size = '10M'
+        stirrup_size = 'D10'
         Av = 2 * self.aci.get_bar_area(stirrup_size)  # Two legs
         
-        # Calculate required spacing
-        # Vs = Av * fy * d / s
+        # Calculate required spacing: Vs = Av * fy * d / s
         s_required = Av * fy * d / Vs_required
         
+        # Check high shear threshold: 0.33 * sqrt(fc') * bw * d
+        Vs_threshold = 0.33 * math.sqrt(fc_prime) * bw * d
+        
         # Maximum spacing limits - ACI 318M-25 Section 9.7.6.2.2
-        s_max = min(d / 2, 600.0)
+        if Vs_required > Vs_threshold:
+            s_max = min(d / 4, 300.0)  # Halved limits for high shear
+        else:
+            s_max = min(d / 2, 600.0)  # Normal limits
+            
         s_actual = min(s_required, s_max)
         
         # Check if larger stirrups are needed
         if s_actual < 75.0:  # Minimum practical spacing
-            stirrup_size = '15M'
+            stirrup_size = 'D12'
             Av = 2 * self.aci.get_bar_area(stirrup_size)
-            s_actual = min(Av * fy * d / Vs_required, s_max)
+            s_required_larger = Av * fy * d / Vs_required
+            s_actual = min(s_required_larger, s_max)
         
         return stirrup_size, s_actual
+    
+    def _calculate_torsional_properties(self, beam_geometry: BeamGeometry, 
+                                      stirrup_size: str = 'D10') -> Dict[str, float]:
+        """
+        Calculate cross-sectional properties for torsion
+        ACI 318M-25 Chapter 22
+        
+        Args:
+            beam_geometry: Beam geometric properties
+            stirrup_size: Assumed closed stirrup size for Aoh calculation
+            
+        Returns:
+            Dictionary containing Acp, pcp, Aoh, ph, and Ao
+        """
+        bw = beam_geometry.width
+        h = beam_geometry.height
+        cover = beam_geometry.cover
+        db_stirrup = self.aci.get_bar_diameter(stirrup_size)
+        
+        # Gross section properties (Acp, pcp)
+        Acp = bw * h
+        pcp = 2 * (bw + h)
+        
+        # Properties of the area enclosed by the shear flow path (Aoh, ph)
+        # Assuming clear cover to the outside of the stirrup
+        x1 = bw - 2 * cover - db_stirrup
+        y1 = h - 2 * cover - db_stirrup
+        
+        if x1 <= 0 or y1 <= 0:
+            raise ValueError("Beam dimensions too small for the specified cover and stirrups.")
+            
+        Aoh = x1 * y1
+        ph = 2 * (x1 + y1)
+        
+        # Gross area enclosed by shear flow path
+        Ao = 0.85 * Aoh
+        
+        return {
+            'Acp': Acp, 'pcp': pcp,
+            'Aoh': Aoh, 'ph': ph,
+            'Ao': Ao
+        }
+
+    def check_torsion_requirement(self, tu: float, beam_geometry: BeamGeometry, 
+                                material_props: MaterialProperties) -> bool:
+        """
+        Check if torsion design is required (Tu > φTth)
+        ACI 318M-25 Section 22.7.4
+        
+        Args:
+            tu: Factored torsional moment (kN⋅m)
+            beam_geometry: Beam geometric properties
+            material_props: Material properties
+            
+        Returns:
+            Boolean indicating if torsion reinforcement is required
+        """
+        if tu <= 0.0:
+            return False
+            
+        fc_prime = material_props.fc_prime
+        phi_t = self.phi_factors['torsion']
+        props = self._calculate_torsional_properties(beam_geometry)
+        
+        # Threshold torsion (Tth) for non-prestressed members - ACI 318M-25 Eq. (22.7.4.1a)
+        # Tth = 0.083 * λ * √fc' * (Acp² / pcp)
+        lambda_factor = 1.0  # Normal weight concrete
+        Tth = 0.083 * lambda_factor * math.sqrt(fc_prime) * (props['Acp']**2 / props['pcp']) / 1e6 # Convert to kN⋅m
+        
+        return tu > (phi_t * Tth)
+
+    def design_combined_shear_torsion(self, vu: float, tu: float, beam_geometry: BeamGeometry,
+                                    material_props: MaterialProperties) -> Tuple[str, float, float]:
+        """
+        Design transverse and longitudinal reinforcement for combined shear and torsion
+        ACI 318M-25 Section 22.7
+        """
+        fc_prime = material_props.fc_prime
+        fy = material_props.fy
+        fyt = material_props.fy # Transverse steel yield strength
+        bw = beam_geometry.width
+        d = beam_geometry.effective_depth
+        
+        props = self._calculate_torsional_properties(beam_geometry)
+        phi_v = self.phi_factors['shear']
+        phi_t = self.phi_factors['torsion']
+        
+        Vu = vu * 1000 # N
+        Tu = tu * 1e6  # N⋅mm
+        
+        # 1. Concrete shear strength (Vc)
+        lambda_factor = 1.0
+        Vc = lambda_factor * 0.17 * math.sqrt(fc_prime) * bw * d # N
+        
+        # 2. Check cross-sectional adequacy (interaction limit) - ACI 318M-25 Section 22.7.7.1
+        shear_stress = Vu / (bw * d)
+        torsion_stress = (Tu * props['ph']) / (1.7 * props['Aoh']**2)
+        combined_stress = math.sqrt(shear_stress**2 + torsion_stress**2)
+        stress_limit = phi_v * ((Vc / (bw * d)) + 0.66 * math.sqrt(fc_prime))
+        
+        if combined_stress > stress_limit:
+            raise ValueError(f"Cross-section inadequate for combined shear and torsion. Increase section dimensions. "
+                             f"(Demand: {combined_stress:.2f} MPa, Limit: {stress_limit:.2f} MPa)")
+                             
+        # 3. Design Transverse Reinforcement (Stirrups)
+        # Required shear reinforcement per mm (Av/s)
+        Vs_required = max(0.0, (Vu / phi_v) - Vc)
+        Av_over_s = Vs_required / (fyt * d) # mm²/mm (2 legs for standard shear)
+        
+        # Required torsion reinforcement per mm per leg (At/s) - ACI 318M-25 Eq. (22.7.6.1)
+        theta = math.radians(45) # Typical assumption for non-prestressed
+        At_over_s = Tu / (phi_t * 2 * props['Ao'] * fyt * (1 / math.tan(theta))) # mm²/mm (per leg)
+        
+        # Total transverse reinforcement per mm (A_{v+t}/s)
+        required_transverse_per_mm = Av_over_s + 2 * At_over_s
+        
+        # Minimum transverse reinforcement - ACI 318M-25 Section 9.6.4.2
+        min_transverse_1 = 0.062 * math.sqrt(fc_prime) * bw / fyt
+        min_transverse_2 = 0.35 * bw / fyt
+        min_transverse = max(min_transverse_1, min_transverse_2)
+        
+        design_transverse_per_mm = max(required_transverse_per_mm, min_transverse)
+        
+        # Select stirrup
+        stirrup_size = 'D10'
+        Av_stirrup = 2 * self.aci.get_bar_area(stirrup_size) # 2 legs of closed hoop
+        s_calculated = Av_stirrup / design_transverse_per_mm
+        
+        # Spacing limits for torsion
+        s_max_torsion = min(props['ph'] / 8, 300.0)
+        
+        # FIXED: Check high shear threshold for shear spacing limits
+        Vs_threshold = 0.33 * math.sqrt(fc_prime) * bw * d
+        if Vs_required > Vs_threshold:
+            s_max_shear = min(d / 4, 300.0)  # Halved limits for high shear
+        else:
+            s_max_shear = min(d / 2, 600.0)  # Normal limits
+            
+        # Apply the most stringent spacing limit
+        s_actual = min(s_calculated, s_max_torsion, s_max_shear)
+        
+        if s_actual < 75.0: # Minimum practical spacing
+            stirrup_size = 'D12'
+            Av_stirrup = 2 * self.aci.get_bar_area(stirrup_size)
+            s_calculated = Av_stirrup / design_transverse_per_mm
+            s_actual = min(s_calculated, s_max_torsion, s_max_shear)
+            
+        # 4. Design Longitudinal Torsion Reinforcement (Al) - ACI 318M-25 Section 22.7.6.1
+        Al_required = At_over_s * props['ph'] * (fyt / fy) * (1 / math.tan(theta))**2
+        
+        # Minimum longitudinal reinforcement - ACI 318M-25 Section 9.6.4.3
+        At_over_s_min = max(At_over_s, 0.175 * bw / fyt)
+        Al_min = (0.42 * math.sqrt(fc_prime) * props['Acp'] / fy) - (At_over_s_min * props['ph'] * (fyt / fy))
+        
+        Al_design = max(Al_required, Al_min, 0.0)
+        
+        return stirrup_size, s_actual, Al_design
     
     def calculate_deflection(self, beam_geometry: BeamGeometry, material_props: MaterialProperties,
                            service_moment: float, reinforcement_area: float) -> float:
@@ -474,33 +680,64 @@ class ACI318M25BeamDesign:
         
         return deflection
     
-    def _select_reinforcement_bars(self, As_required: float) -> List[str]:
-        """Select reinforcement bars to provide required area"""
-        # Available bar sizes and areas
+    def _select_reinforcement_bars(self, As_required: float, beam_geometry: BeamGeometry, 
+                                   fy: float, stirrup_size: str = 'D10', aggregate_size: float = 25.0) -> List[str]:
+        """
+        Select reinforcement bars to provide required area while satisfying 
+        ACI 318M-25 spacing limits (minimum clear spacing and maximum spacing for crack control).
+        """
+        # Available PNS 49 bar sizes and areas
         bar_data = [
-            ('15M', 200), ('20M', 300), ('25M', 500), ('30M', 700),
-            ('35M', 1000), ('45M', 1500), ('55M', 2500)
+            ('D16', 201.06), ('D20', 314.16), ('D25', 490.87), 
+            ('D28', 615.75), ('D32', 804.25), ('D36', 1017.88), 
+            ('D40', 1256.64), ('D50', 1963.50)
         ]
         
-        selected_bars = []
-        remaining_area = As_required
+        # Calculate available width between stirrup legs
+        d_stirrup = self.aci.get_bar_diameter(stirrup_size)
+        cc = beam_geometry.cover  # Clear cover
+        available_width = beam_geometry.width - (2 * cc) - (2 * d_stirrup)
         
-        # Start with largest bars and work down
-        for bar_size, area in reversed(bar_data):
-            if remaining_area <= 0:
-                break
+        # Determine maximum spacing for crack control - ACI 318M-25 24.3.2
+        crack_control_data = self.aci.check_crack_control(fy=fy, cc=cc)
+        max_spacing = crack_control_data['max_spacing_mm']
+        
+        best_selection = []
+        
+        for bar_size, area in bar_data:
+            num_bars = max(2, math.ceil(As_required / area)) 
+            db = self.aci.get_bar_diameter(bar_size)
             
-            num_bars = int(remaining_area / area)
-            if num_bars > 0:
-                for _ in range(num_bars):
-                    selected_bars.append(bar_size)
-                remaining_area -= num_bars * area
+            # Minimum clear spacing - ACI 318M-25 Section 25.2.1
+            min_clear_spacing = max(25.0, db, (4.0/3.0) * aggregate_size)
+            
+            # Required width for a single layer
+            required_width = (num_bars * db) + ((num_bars - 1) * min_clear_spacing)
+            
+            # Calculate actual center-to-center spacing
+            c2c_spacing = (available_width - db) / (num_bars - 1) if num_bars > 1 else 0.0
+            
+            # Check 1: Does it fit in a single layer?
+            if required_width <= available_width:
+                # Check 2: Does it violate max spacing for crack control?
+                if c2c_spacing <= max_spacing:
+                    return [bar_size] * num_bars
+            else:
+                # Fallback to 2 layers evaluation
+                bars_per_layer = math.ceil(num_bars / 2)
+                req_width_2_layers = (bars_per_layer * db) + ((bars_per_layer - 1) * min_clear_spacing)
+                
+                if req_width_2_layers <= available_width:
+                    if not best_selection:
+                        best_selection = [bar_size] * num_bars
         
-        # If we still need more area, add one more bar of the smallest practical size
-        if remaining_area > 0:
-            selected_bars.append('15M')
-        
-        return selected_bars if selected_bars else ['15M']
+        if best_selection:
+            return best_selection
+            
+        # Fallback 2: Extremely narrow beam
+        largest_bar, largest_area = bar_data[-1]
+        num_largest = math.ceil(As_required / largest_area)
+        return [largest_bar] * num_largest
     
     def _calculate_beta1(self, fc_prime: float) -> float:
         """Calculate β₁ factor for concrete - ACI 318M-25 Section 22.2.2.4.3"""
@@ -513,9 +750,10 @@ class ACI318M25BeamDesign:
     
     def perform_complete_beam_design(self, mu: float, vu: float, beam_geometry: BeamGeometry,
                                    material_props: MaterialProperties,
-                                   service_moment: float = None) -> BeamAnalysisResult:
+                                   service_moment: float = None,
+                                   tu: float = 0.0) -> BeamAnalysisResult:
         """
-        Perform complete beam design analysis
+        Perform complete beam design analysis including combined shear and torsion
         
         Args:
             mu: Factored moment (kN⋅m)
@@ -523,24 +761,39 @@ class ACI318M25BeamDesign:
             beam_geometry: Beam geometric properties
             material_props: Material properties
             service_moment: Service moment for deflection (kN⋅m)
+            tu: Factored torsional moment (kN⋅m) - Defaults to 0.0
             
         Returns:
             Complete beam analysis results
         """
         design_notes = []
         
-        # Flexural design
+        # 1. Flexural design (primary bending)
         flexural_design = self.design_flexural_reinforcement(mu, beam_geometry, material_props)
         
-        # Shear design
-        stirrup_size, stirrup_spacing = self.design_shear_reinforcement(
-            vu, beam_geometry, material_props, flexural_design.main_area
-        )
+        # 2. Torsion and Shear Branching
+        torsion_required = self.check_torsion_requirement(tu, beam_geometry, material_props)
+        
+        if torsion_required:
+            stirrup_size, stirrup_spacing, al_required = self.design_combined_shear_torsion(
+                vu, tu, beam_geometry, material_props
+            )
+            flexural_design.torsion_required = True
+            flexural_design.torsion_longitudinal_area = al_required
+            design_notes.append(f"Torsion design governed. Distribute {al_required:.1f} mm² of additional longitudinal steel around the section perimeter.")
+        else:
+            stirrup_size, stirrup_spacing = self.design_shear_reinforcement(
+                vu, beam_geometry, material_props, flexural_design.main_area
+            )
+            flexural_design.torsion_required = False
+            flexural_design.torsion_longitudinal_area = 0.0
+            if tu > 0:
+                design_notes.append("Torsion demand is below the threshold; combined shear-torsion design is not required.")
         
         flexural_design.stirrups = stirrup_size
         flexural_design.stirrup_spacing = stirrup_spacing
         
-        # Calculate capacities
+        # 3. Calculate capacities
         moment_capacity = self._calculate_moment_capacity(
             flexural_design.main_area, beam_geometry, material_props
         )
@@ -549,19 +802,37 @@ class ACI318M25BeamDesign:
             beam_geometry, material_props, stirrup_size, stirrup_spacing
         )
         
-        # Deflection calculation
+        torsion_capacity = 0.0
+        if torsion_required and stirrup_size != 'None':
+            torsion_capacity = self._calculate_torsion_capacity(
+                beam_geometry, material_props, stirrup_size, stirrup_spacing
+            )
+        
+        # 4. Deflection calculation
         deflection = 0.0
         if service_moment:
             deflection = self.calculate_deflection(
                 beam_geometry, material_props, service_moment, flexural_design.main_area
             )
         
-        # Utilization ratio
-        utilization_moment = mu / moment_capacity if moment_capacity > 0 else 1.0
-        utilization_shear = vu / shear_capacity if shear_capacity > 0 else 1.0
-        utilization_ratio = max(utilization_moment, utilization_shear)
+        # 5. Utilization ratio
+        # Retrieve strength reduction factors
+        phi_m = self.phi_factors['flexure_tension_controlled'] 
+        phi_v = self.phi_factors['shear']
+        phi_t = self.phi_factors['torsion']
         
-        # Design notes
+        # Calculate design capacities
+        design_moment_cap = phi_m * moment_capacity
+        design_shear_cap = phi_v * shear_capacity
+        design_torsion_cap = phi_t * torsion_capacity
+        
+        utilization_moment = mu / design_moment_cap if design_moment_cap > 0 else 1.0
+        utilization_shear = vu / design_shear_cap if design_shear_cap > 0 else 1.0
+        utilization_torsion = tu / design_torsion_cap if design_torsion_cap > 0 else 0.0
+        
+        utilization_ratio = max(utilization_moment, utilization_shear, utilization_torsion)
+        
+        # 6. Standard design notes
         if flexural_design.compression_area > 0:
             design_notes.append("Compression reinforcement required")
         
@@ -574,8 +845,9 @@ class ACI318M25BeamDesign:
         return BeamAnalysisResult(
             moment_capacity=moment_capacity,
             shear_capacity=shear_capacity,
+            torsion_capacity=torsion_capacity,
             deflection=deflection,
-            crack_width=0.0,  # Simplified - detailed crack analysis needed
+            crack_width=0.0,
             reinforcement=flexural_design,
             utilization_ratio=utilization_ratio,
             design_notes=design_notes
@@ -620,3 +892,22 @@ class ACI318M25BeamDesign:
         Vn = Vc + Vs
         
         return Vn
+    
+    def _calculate_torsion_capacity(self, beam_geometry: BeamGeometry,
+                                  material_props: MaterialProperties,
+                                  stirrup_size: str, stirrup_spacing: float) -> float:
+        """Calculate nominal torsion capacity (Tn) based on provided stirrups"""
+        if stirrup_size == 'None' or stirrup_spacing <= 0:
+            return 0.0
+            
+        fyt = material_props.fy
+        theta = math.radians(45) # Typical assumption for non-prestressed
+        
+        props = self._calculate_torsional_properties(beam_geometry, stirrup_size)
+        At = self.aci.get_bar_area(stirrup_size) # Area of ONE leg
+        
+        # Nominal torsion capacity - ACI 318M-25 Eq. (22.7.6.1)
+        # Tn = 2 * Ao * At * fyt * cot(θ) / s
+        Tn = 2 * props['Ao'] * At * fyt * (1 / math.tan(theta)) / stirrup_spacing
+        
+        return Tn / 1e6 # Convert N⋅mm to kN⋅m

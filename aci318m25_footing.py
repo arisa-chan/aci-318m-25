@@ -118,7 +118,7 @@ class ACI318M25FootingDesign:
         # Minimum reinforcement requirements
         self.min_reinforcement = {
             'ratio': 0.0012,           # Minimum reinforcement ratio for footings
-            'min_bar_size': '15M',     # Minimum bar size
+            'min_bar_size': 'D16',     # Minimum bar size
             'max_spacing': 450,        # Maximum bar spacing (mm)
             'min_spacing': 150         # Minimum bar spacing (mm)
         }
@@ -157,10 +157,10 @@ class ACI318M25FootingDesign:
         
         if abs(Mx_service) < 0.001 and abs(My_service) < 0.001:
             # Concentric loading
-            required_area = P_total / qa  # mm²
+            required_area = P_total / qa  # m²
             # Assume square footing for concentric loading
             side_length = math.sqrt(required_area)
-            return side_length, side_length
+            return side_length * 1000, side_length * 1000 # Convert to mm
         else:
             # Eccentric loading - iterative approach needed
             # Start with concentric area and increase
@@ -186,7 +186,8 @@ class ACI318M25FootingDesign:
                 factor *= 1.2
                 B = L = math.sqrt(base_area * factor)
             
-            return L, B
+            # Convert final m to mm before returning
+            return L * 1000, B * 1000
     
     def calculate_bearing_pressure(self, geometry: FootingGeometry,
                                  loads: FootingLoads) -> Tuple[float, float, bool]:
@@ -257,8 +258,9 @@ class ACI318M25FootingDesign:
         qu = loads.axial_force / bearing_area  # kPa
         
         # Shear force at critical section (both directions)
-        Vu_x = qu * critical_distance_x * geometry.width / 1000  # kN
-        Vu_y = qu * critical_distance_y * geometry.length / 1000  # kN
+        # FIXED: Divide by 1e6 to convert mm² to m²
+        Vu_x = qu * critical_distance_x * geometry.width / 1e6  # kN
+        Vu_y = qu * critical_distance_y * geometry.length / 1e6  # kN
         
         # Concrete shear strength - ACI 318M-25 Eq. (22.5.5.1)
         lambda_factor = 1.0  # Normal weight concrete
@@ -286,14 +288,6 @@ class ACI318M25FootingDesign:
         """
         Check two-way shear (punching shear)
         ACI 318M-25 Section 22.6
-        
-        Args:
-            geometry: Footing geometric properties
-            loads: Footing load conditions
-            material_props: Material properties
-            
-        Returns:
-            Tuple of (is_adequate, utilization_ratio)
         """
         fc_prime = material_props.fc_prime
         d = geometry.thickness - geometry.cover - 20  # Effective depth
@@ -309,19 +303,18 @@ class ACI318M25FootingDesign:
         critical_area = (geometry.column_width + d) * (geometry.column_depth + d) / 1e6  # m²
         Vu = loads.axial_force - qu * critical_area  # kN
         
-        # Punching shear strength - ACI 318M-25 Section 22.6.5.2
-        beta = geometry.column_width / geometry.column_depth  # Column aspect ratio
-        beta = max(min(beta, 1/beta), 1.0)  # Ensure beta >= 1
+        # Correctly calculate beta (ratio of long side to short side of column)
+        col_max = max(geometry.column_width, geometry.column_depth)
+        col_min = min(geometry.column_width, geometry.column_depth)
+        beta = col_max / col_min if col_min > 0 else 1.0
         
         # Three controlling equations:
-        # Equation 1: Basic punching shear
         vc1 = 0.17 * (1 + 2/beta) * math.sqrt(fc_prime)
         
-        # Equation 2: Based on column location (interior column)
-        alphas = 40  # For interior columns
+        # Note: Assuming interior column (alphas = 40). 
+        # For edge/corner columns, alphas drops to 30 or 20, and 'bo' calculation changes.
+        alphas = 40  
         vc2 = 0.083 * (alphas * d / bo + 2) * math.sqrt(fc_prime)
-        
-        # Equation 3: Maximum punching shear
         vc3 = 0.33 * math.sqrt(fc_prime)
         
         # Controlling punching shear strength
@@ -329,12 +322,9 @@ class ACI318M25FootingDesign:
         
         # Nominal punching shear capacity
         Vn = vc * bo * d / 1000  # Convert to kN
-        
-        # Design capacity
         phi = self.phi_factors['shear']
         phi_Vn = phi * Vn
         
-        # Check adequacy
         utilization_ratio = Vu / phi_Vn if phi_Vn > 0 else float('inf')
         is_adequate = utilization_ratio <= 1.0
         
@@ -346,14 +336,6 @@ class ACI318M25FootingDesign:
         """
         Design flexural reinforcement for footing
         ACI 318M-25 Chapter 13
-        
-        Args:
-            geometry: Footing geometric properties
-            loads: Footing load conditions
-            material_props: Material properties
-            
-        Returns:
-            Footing reinforcement design
         """
         fc_prime = material_props.fc_prime
         fy = material_props.fy
@@ -375,14 +357,27 @@ class ACI318M25FootingDesign:
         As_x = self._calculate_required_steel_area(Mu_x, 1000, d, fc_prime, fy)  # per meter width
         As_y = self._calculate_required_steel_area(Mu_y, 1000, d, fc_prime, fy)  # per meter width
         
-        # Check minimum reinforcement
-        As_min = self.min_reinforcement['ratio'] * geometry.thickness * 1000  # per meter
+        # Correct minimum reinforcement: Shrinkage and temperature steel per ACI 318M-25
+        if fy <= 420:
+            rho_min = 0.0020
+        elif fy <= 520:
+            rho_min = 0.0018
+        else:
+            rho_min = 0.0018 * 420.0 / fy
+            
+        # As_min applies to gross section (width * thickness)
+        As_min = rho_min * 1000 * geometry.thickness  # per meter width
+        
         As_x = max(As_x, As_min)
         As_y = max(As_y, As_min)
         
-        # Select reinforcement
-        bar_x, spacing_x = self._select_footing_reinforcement(As_x)
-        bar_y, spacing_y = self._select_footing_reinforcement(As_y)
+        # Select reinforcement considering spacing limits
+        bar_x, spacing_x = self._select_footing_reinforcement(
+            As_x, 1000.0, fy, geometry.thickness, geometry.cover
+        )
+        bar_y, spacing_y = self._select_footing_reinforcement(
+            As_y, 1000.0, fy, geometry.thickness, geometry.cover
+        )
         
         # Development length
         development_length = self.aci.calculate_development_length(bar_x, fc_prime, fy)
@@ -395,9 +390,9 @@ class ACI318M25FootingDesign:
             # May need hooks or larger footing
             pass
         
-        # Design column dowels (simplified)
-        dowel_bars = self._design_column_dowels(loads.axial_force, material_props)
-        dowel_length = max(development_length, 300)  # Minimum 300mm
+        # Design column dowels (passing geometry to compute Ag)
+        dowel_bars = self._design_column_dowels(geometry, material_props)
+        dowel_length = max(development_length, 300.0)  # Minimum 300mm
         
         return FootingReinforcement(
             bottom_bars_x=bar_x,
@@ -405,7 +400,7 @@ class ACI318M25FootingDesign:
             bottom_bars_y=bar_y,
             bottom_spacing_y=spacing_y,
             top_bars='None',  # Usually not required for footings
-            top_spacing=0,
+            top_spacing=0.0,
             development_length=development_length,
             dowel_bars=dowel_bars,
             dowel_length=dowel_length
@@ -423,62 +418,88 @@ class ACI318M25FootingDesign:
         
         phi = self.phi_factors['flexure']
         
-        # Quadratic equation: Mu = φ * As * fy * (d - a/2)
-        # where a = As * fy / (0.85 * fc_prime * b)
+        # CORRECTED SIGNS
         A = phi * fy**2 / (2 * 0.85 * fc_prime * width)
-        B = phi * fy * effective_depth
-        C = -Mu
+        B = -phi * fy * effective_depth # Must be negative
+        C = Mu                          # Must be positive
         
         discriminant = B**2 - 4*A*C
         if discriminant < 0:
             raise ValueError("Section inadequate for applied moment")
         
-        As_required = (-B + math.sqrt(discriminant)) / (2*A)
+        # CORRECTED ROOT (Negative root for tension-controlled behavior)
+        As_required = (-B - math.sqrt(discriminant)) / (2*A)
         
         return As_required
     
-    def _select_footing_reinforcement(self, As_required: float) -> Tuple[str, float]:
-        """Select appropriate bar size and spacing for footing"""
+    def _select_footing_reinforcement(self, As_required: float, width: float,
+                                      fy: float, thickness: float, cover: float,
+                                      aggregate_size: float = 25.0) -> Tuple[str, float]:
+        """Select appropriate bar size and spacing for footing considering ACI 318M-25 limits"""
         # Common footing bar sizes
-        bar_sizes = ['15M', '20M', '25M', '30M']
+        bar_sizes = ['D16', 'D20', 'D25', 'D28', 'D32', 'D36']
+        
+        # Calculate maximum spacing for crack control (ACI 318M-25 Sec. 24.3.2)
+        fs = (2.0 / 3.0) * fy
+        s_limit_1 = 380 * (280 / fs) - 2.5 * cover
+        s_limit_2 = 300 * (280 / fs)
+        max_crack_spacing = min(s_limit_1, s_limit_2)
+        
+        # General maximum spacing limit for footings (typically 3h or 450mm)
+        max_general_spacing = min(3 * thickness, self.min_reinforcement['max_spacing'])
+        
+        # Governing maximum spacing
+        max_spacing = min(max_crack_spacing, max_general_spacing)
         
         for bar_size in bar_sizes:
             bar_area = self.aci.get_bar_area(bar_size)
-            spacing = bar_area * 1000 / As_required  # Spacing for 1m width
+            db = self.aci.get_bar_diameter(bar_size)
             
-            # Check spacing limits
-            max_spacing = self.min_reinforcement['max_spacing']
-            min_spacing = self.min_reinforcement['min_spacing']
+            # Theoretical required spacing to meet area
+            spacing = bar_area * width / As_required
             
-            if min_spacing <= spacing <= max_spacing:
+            # Minimum clear spacing limits (ACI 318M-25 Sec. 25.2.1)
+            min_clear_spacing = max(25.0, db, (4.0/3.0) * aggregate_size)
+            min_c2c_spacing = min_clear_spacing + db
+            
+            if min_c2c_spacing <= spacing <= max_spacing:
                 return bar_size, spacing
         
-        # If no suitable spacing, use maximum allowed
-        bar_size = '20M'
+        # If no suitable spacing is found, use a standard default with maximum allowable spacing
+        bar_size = 'D20'
         bar_area = self.aci.get_bar_area(bar_size)
-        spacing = min(max_spacing, bar_area * 1000 / As_required)
+        spacing = min(max_spacing, bar_area * width / As_required)
         
         return bar_size, spacing
     
-    def _design_column_dowels(self, axial_load: float,
+    def _design_column_dowels(self, geometry: FootingGeometry,
                             material_props: MaterialProperties) -> str:
-        """Design column dowel bars for load transfer"""
-        # Simplified dowel design - detailed analysis needed for actual design
-        fy = material_props.fy
+        """
+        Design column dowel bars for load transfer
+        ACI 318M-25 Section 16.3.4
+        """
+        # Gross area of supported column (Ag)
+        Ag = geometry.column_width * geometry.column_depth
         
-        # Minimum dowel area (simplified)
-        As_dowel = max(0.005 * axial_load * 1000 / fy,  # 0.5% of load
-                      400)  # Minimum area
+        # Minimum dowel area across interface is 0.005 * Ag
+        As_dowel = 0.005 * Ag
         
-        # Select bar size based on required area
-        if As_dowel <= 200:
-            return '15M'
-        elif As_dowel <= 300:
-            return '20M'
-        elif As_dowel <= 500:
-            return '25M'
+        # Assuming a minimum of 4 dowel bars (one at each column corner)
+        As_per_bar = As_dowel / 4.0
+        
+        # Select appropriate dowel bar size
+        if As_per_bar <= self.aci.get_bar_area('D16'):
+            return 'D16'
+        elif As_per_bar <= self.aci.get_bar_area('D20'):
+            return 'D20'
+        elif As_per_bar <= self.aci.get_bar_area('D25'):
+            return 'D25'
+        elif As_per_bar <= self.aci.get_bar_area('D28'):
+            return 'D28'
+        elif As_per_bar <= self.aci.get_bar_area('D32'):
+            return 'D32'
         else:
-            return '30M'
+            return 'D36'
     
     def perform_complete_footing_design(self, loads: FootingLoads,
                                       soil_props: SoilProperties,

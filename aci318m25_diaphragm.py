@@ -163,54 +163,31 @@ class ACI318M25DiaphragmDesign:
     
     def calculate_diaphragm_forces(self, loads: DiaphragmLoads,
                                  geometry: DiaphragmGeometry) -> Dict[str, float]:
-        """
-        Calculate diaphragm design forces
-        ACI 318M-25 Section 12.10
-        
-        Args:
-            loads: Diaphragm loading conditions
-            geometry: Diaphragm geometric properties
-            
-        Returns:
-            Dictionary of design forces
-        """
-        # Basic design force
+        """Calculate diaphragm design forces"""
         if loads.load_type == DiaphragmLoadType.SEISMIC:
-            # Seismic diaphragm force per ASCE 7
             base_force = loads.lateral_force
-            
-            # Apply amplification factors
-            if geometry.aspect_ratio > 3.0:
-                amplification = 1.25  # For high aspect ratio diaphragms
-            else:
-                amplification = 1.0
-                
+            amplification = 1.25 if geometry.aspect_ratio > 3.0 else 1.0
             design_force = base_force * amplification
-            
         elif loads.load_type == DiaphragmLoadType.WIND:
-            # Wind force on diaphragm
-            tributary_area = geometry.length * geometry.width / 1e6  # m²
+            tributary_area = geometry.length * geometry.width / 1e6
             design_force = loads.wind_pressure * tributary_area
-            
         else:
             design_force = loads.lateral_force
         
-        # Apply irregularity penalties
         if geometry.irregularities:
             design_force *= self.seismic_factors['irregularity_penalty']
         
-        # Calculate unit shear
         effective_width = geometry.width
         if geometry.openings:
-            # Reduce effective width for openings
             total_opening_width = sum(opening[2] for opening in geometry.openings)
             effective_width = max(geometry.width - total_opening_width, 0.5 * geometry.width)
         
-        unit_shear = design_force / effective_width if effective_width > 0 else 0
+        # FIXED: Convert effective width to meters for standard kN/m output
+        effective_width_m = effective_width / 1000.0
+        unit_shear = design_force / effective_width_m if effective_width_m > 0 else 0.0
         
-        # Chord forces at diaphragm boundaries
-        moment_arm = geometry.width * 0.9  # Approximate moment arm
-        max_moment = design_force * geometry.length / 8  # Simplified for uniform load
+        moment_arm = geometry.width * 0.9 
+        max_moment = design_force * geometry.length / 8 
         chord_force = max_moment / moment_arm if moment_arm > 0 else 0
         
         return {
@@ -266,68 +243,48 @@ class ACI318M25DiaphragmDesign:
     def assess_diaphragm_flexibility(self, geometry: DiaphragmGeometry,
                                    material_props: MaterialProperties,
                                    loads: DiaphragmLoads) -> Tuple[DiaphragmBehavior, float]:
-        """
-        Assess diaphragm flexibility per ASCE 7
+        """Assess diaphragm flexibility per general ASCE 7 aspect ratio guidelines"""
+        span = max(geometry.length, geometry.width)
+        depth = min(geometry.length, geometry.width)
         
-        Args:
-            geometry: Diaphragm geometric properties
-            material_props: Material properties
-            loads: Loading conditions
-            
-        Returns:
-            Tuple of (behavior_classification, flexibility_ratio)
-        """
-        # Diaphragm properties
-        L = max(geometry.length, geometry.width)  # Maximum span
-        E = material_props.ec  # Modulus of elasticity
+        # Aspect ratio is a reliable proxy for flexibility classification in regular structures
+        aspect_ratio = span / depth if depth > 0 else 0
         
-        # Moment of inertia per unit width
-        t = geometry.thickness
-        I = t**3 / 12  # mm⁴/mm
-        
-        # Flexibility parameter
-        flexibility_ratio = (L**3) / (E * I * t)  # Normalized flexibility
-        
-        # Classification based on flexibility
-        if flexibility_ratio <= self.flexibility_criteria['rigid_limit']:
-            behavior = DiaphragmBehavior.RIGID
-        elif flexibility_ratio >= self.flexibility_criteria['flexible_limit']:
+        if aspect_ratio >= 3.0:
             behavior = DiaphragmBehavior.FLEXIBLE
+        elif aspect_ratio <= 1.5:
+            behavior = DiaphragmBehavior.RIGID
         else:
             behavior = DiaphragmBehavior.SEMI_RIGID
-        
-        return behavior, flexibility_ratio
+            
+        return behavior, aspect_ratio
     
     def calculate_diaphragm_deflection(self, geometry: DiaphragmGeometry,
                                      material_props: MaterialProperties,
                                      loads: DiaphragmLoads) -> float:
-        """
-        Calculate maximum diaphragm deflection
-        
-        Args:
-            geometry: Diaphragm geometric properties
-            material_props: Material properties
-            loads: Loading conditions
-            
-        Returns:
-            Maximum deflection (mm)
-        """
-        # Simplified deflection calculation for uniformly loaded diaphragm
+        """Calculate maximum diaphragm deflection (In-Plane Deep Beam Action)"""
+        # Assume lateral load spans the longer dimension for worst-case flexure
         L = max(geometry.length, geometry.width)
-        w = loads.lateral_force / L  # Load per unit length
+        depth = min(geometry.length, geometry.width)
+        
+        # Convert load to N/mm
+        w_N_mm = (loads.lateral_force / L) * 1000
+        
         E = material_props.ec
         t = geometry.thickness
-        I = t**3 / 12  # Moment of inertia per unit width
         
-        # For simply supported diaphragm with uniform load
-        # δ = 5wL⁴/(384EI)
-        deflection = (5 * w * L**4) / (384 * E * I)
+        # In-plane moment of inertia for the deep beam
+        I_in_plane = (t * depth**3) / 12  # mm⁴
         
-        # Account for shear deformation (approximate)
-        shear_deflection = deflection * 0.2  # Approximate 20% additional
-        total_deflection = deflection + shear_deflection
+        # 1. Flexural deflection: 5wL⁴ / 384EI
+        deflection_flexural = (5 * w_N_mm * L**4) / (384 * E * I_in_plane)
         
-        return total_deflection
+        # 2. Shear deflection (critical for deep beams): wL² / 8AG
+        G = E / 2.4  # Approximate shear modulus
+        A_shear = t * depth
+        deflection_shear = (w_N_mm * L**2) / (8 * A_shear * G)
+        
+        return deflection_flexural + deflection_shear
     
     def design_chord_reinforcement(self, chord_force: float,
                                  geometry: DiaphragmGeometry,
@@ -407,73 +364,52 @@ class ACI318M25DiaphragmDesign:
     def design_diaphragm_reinforcement(self, forces: Dict[str, float],
                                      geometry: DiaphragmGeometry,
                                      material_props: MaterialProperties) -> DiaphragmReinforcement:
-        """
-        Design complete diaphragm reinforcement
-        
-        Args:
-            forces: Dictionary of design forces
-            geometry: Diaphragm geometric properties
-            material_props: Material properties
-            
-        Returns:
-            Complete diaphragm reinforcement design
-        """
+        """Design complete diaphragm reinforcement"""
         fc_prime = material_props.fc_prime
         fy = material_props.fy
         t = geometry.thickness
         
-        # Main reinforcement for in-plane shear
+        # Required shear capacity in kN/m
         required_shear_capacity = forces['unit_shear'] / self.phi_factors['shear']
         
-        # Calculate required reinforcement ratio
-        Vc = 0.17 * math.sqrt(fc_prime) * t / 1000  # kN/m
-        Vs_required = max(0, required_shear_capacity - Vc)
+        # FIXED: 0.17 * sqrt(fc) * t natively yields N/mm, which is exactly kN/m. No division needed.
+        Vc = 0.17 * math.sqrt(fc_prime) * t  # kN/m
+        Vs_required = max(0.0, required_shear_capacity - Vc)
         
         if Vs_required > 0:
-            As_required = Vs_required * 1000 / fy  # mm²/m
-            rho_required = As_required / (t * 1000)
+            As_required = Vs_required * 1000.0 / fy  # mm²/m
+            rho_required = As_required / (t * 1000.0)
         else:
-            rho_required = 0
+            rho_required = 0.0
         
-        # Check minimum reinforcement
         rho_min = self.diaphragm_requirements['min_reinforcement_ratio']
         rho_design = max(rho_required, rho_min)
         
-        # Select reinforcement in both directions
-        As_design = rho_design * t * 1000  # mm²/m
+        As_design = rho_design * t * 1000.0  # mm²/m
         
         main_bar_x, spacing_x = self._select_diaphragm_reinforcement(As_design)
         main_bar_y, spacing_y = self._select_diaphragm_reinforcement(As_design)
         
-        # Chord reinforcement
         chord_bars = self.design_chord_reinforcement(
             forces['chord_force'], geometry, material_props
         )
-        
-        # Collector elements
         collectors = self.design_collector_elements(forces, geometry, material_props)
         
-        # Additional shear reinforcement if needed
-        if Vs_required > 0.5 * Vc:
-            shear_reinforcement = main_bar_x  # Use same as main reinforcement
-        else:
-            shear_reinforcement = 'None'
+        shear_reinforcement = main_bar_x if Vs_required > 0.5 * Vc else 'None'
         
         return DiaphragmReinforcement(
-            main_bars_x=main_bar_x,
-            main_spacing_x=spacing_x,
-            main_bars_y=main_bar_y,
-            main_spacing_y=spacing_y,
+            main_bars_x=main_bar_x, main_spacing_x=spacing_x,
+            main_bars_y=main_bar_y, main_spacing_y=spacing_y,
             chord_reinforcement=chord_bars,
             collector_reinforcement=collectors,
             shear_reinforcement=shear_reinforcement,
-            connection_details={'type': 'standard_dowels', 'size': '20M'}
+            connection_details={'type': 'standard_dowels', 'size': 'D20'}
         )
     
     def _select_diaphragm_reinforcement(self, As_required: float) -> Tuple[str, float]:
         """Select appropriate bar size and spacing for diaphragm"""
         # Common diaphragm bar sizes
-        bar_sizes = ['10M', '15M', '20M']
+        bar_sizes = ['D10', 'D12', 'D16', 'D20']
         
         for bar_size in bar_sizes:
             bar_area = self.aci.get_bar_area(bar_size)
@@ -487,39 +423,29 @@ class ACI318M25DiaphragmDesign:
                 return bar_size, spacing
         
         # If no suitable spacing, use maximum allowed
-        bar_size = '15M'
+        bar_size = 'D10'
         bar_area = self.aci.get_bar_area(bar_size)
         spacing = min(max_spacing, bar_area * 1000 / As_required)
         
         return bar_size, spacing
     
     def _select_chord_reinforcement(self, As_required: float) -> List[str]:
-        """Select chord reinforcement bars"""
-        # Available bar sizes and areas
+        """Select uniform chord reinforcement bars (minimum of 2 bars)"""
         bar_data = [
-            ('20M', 300), ('25M', 500), ('30M', 700),
-            ('35M', 1000), ('45M', 1500)
+            ('D16', 201.06), ('D20', 314.16), ('D25', 490.87), 
+            ('D28', 615.75), ('D32', 804.25), ('D36', 1017.88)
         ]
         
-        selected_bars = []
-        remaining_area = As_required
-        
-        # Start with largest bars and work down
-        for bar_size, area in reversed(bar_data):
-            if remaining_area <= 0:
-                break
-            
-            num_bars = int(remaining_area / area)
-            if num_bars > 0:
-                for _ in range(num_bars):
-                    selected_bars.append(bar_size)
-                remaining_area -= num_bars * area
-        
-        # If we still need more area, add one more bar
-        if remaining_area > 0:
-            selected_bars.append('20M')
-        
-        return selected_bars if selected_bars else ['20M', '20M']  # Minimum
+        for bar_size, area in bar_data:
+            num_bars = max(2, math.ceil(As_required / area))
+            # Keep the bundle to a constructible limit (e.g., <= 8 bars per chord boundary)
+            if num_bars <= 8:
+                return [bar_size] * num_bars
+                
+        # Fallback to largest bar size
+        largest_bar, largest_area = bar_data[-1]
+        num_bars = max(2, math.ceil(As_required / largest_area))
+        return [largest_bar] * num_bars
     
     def _design_collector_reinforcement(self, axial_force: float,
                                       material_props: MaterialProperties) -> List[str]:
@@ -580,15 +506,19 @@ class ACI318M25DiaphragmDesign:
         rho_design = self.diaphragm_requirements['min_reinforcement_ratio']
         shear_capacity = self.calculate_shear_capacity(geometry, material_props, rho_design)
         
-        # Out-of-plane moment capacity (simplified)
-        As_out_plane = rho_design * geometry.thickness * 1000  # mm²/m
-        d = geometry.thickness - geometry.cover - 10  # Effective depth
+        As_out_plane = rho_design * geometry.thickness * 1000 
+        d = geometry.thickness - geometry.cover - 10 
         a = As_out_plane * material_props.fy / (0.85 * material_props.fc_prime * 1000)
-        moment_capacity = As_out_plane * material_props.fy * (d - a/2) / 1e6  # kN⋅m/m
+        moment_capacity = As_out_plane * material_props.fy * (d - a/2) / 1e6
+        
+        # FIXED: Actual Chord Capacity calculation
+        As_provided_chord = sum([self.aci.get_bar_area(b) for b in reinforcement.chord_reinforcement])
+        phi_tension = self.phi_factors['axial_tension']
+        chord_capacity_kn = (phi_tension * As_provided_chord * material_props.fy) / 1000.0
         
         # Calculate utilization ratios
-        shear_utilization = forces['unit_shear'] / (self.phi_factors['shear'] * shear_capacity)
-        chord_utilization = forces['chord_force'] / (1000)  # Simplified
+        shear_utilization = forces['unit_shear'] / (self.phi_factors['shear'] * shear_capacity) if shear_capacity > 0 else 0
+        chord_utilization = forces['chord_force'] / chord_capacity_kn if chord_capacity_kn > 0 else 0
         
         utilization_ratio = max(shear_utilization, chord_utilization)
         

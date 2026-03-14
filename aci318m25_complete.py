@@ -169,22 +169,25 @@ class ACI318M25MemberLibrary:
         beam_moment = beam_factored_load * (typical_span ** 2) / 8  # Simply supported
         beam_shear = beam_factored_load * typical_span / 2
         
-        beam_result = self.beam_design.perform_complete_beam_design(
-            mu=beam_moment,
-            vu=beam_shear,
-            beam_geometry=beam_geometry,
-            material_props=material_props,
-            service_moment=beam_moment / 1.6  # Approximate service moment
-        )
-        
-        results['beam'] = {
-            'geometry': beam_geometry,
-            'loads': {'moment': beam_moment, 'shear': beam_shear},
-            'design_result': beam_result,
-            'summary': f"Beam: {beam_geometry.width}x{beam_geometry.height}mm, "
-                      f"Main bars: {beam_result.reinforcement.main_bars}, "
-                      f"Stirrups: {beam_result.reinforcement.stirrups}@{beam_result.reinforcement.stirrup_spacing:.0f}mm"
-        }
+        try :
+            beam_result = self.beam_design.perform_complete_beam_design(
+                mu=beam_moment,
+                vu=beam_shear,
+                beam_geometry=beam_geometry,
+                material_props=material_props,
+                service_moment=beam_moment / 1.6  # Approximate service moment
+            )
+            
+            results['beam'] = {
+                'geometry': beam_geometry,
+                'loads': {'moment': beam_moment, 'shear': beam_shear},
+                'design_result': beam_result,
+                'summary': f"Beam: {beam_geometry.width}x{beam_geometry.height}mm, "
+                        f"Main bars: {beam_result.reinforcement.main_bars}, "
+                        f"Stirrups: {beam_result.reinforcement.stirrups}@{beam_result.reinforcement.stirrup_spacing:.0f}mm"
+            }
+        except Exception as e :
+            results['beam'] = {'summary': f"Beam Design FAILED: {str(e)}"}
         
         # 2. Column Design
         column_geometry = ColumnGeometry(
@@ -204,34 +207,37 @@ class ACI318M25MemberLibrary:
         
         column_loads = ColumnLoads(
             axial_force=total_load * 1.4,    # Factored axial load
-            moment_x=total_load * 0.1,       # Small moment due to eccentricity
-            moment_y=0,
-            shear_x=0,
-            shear_y=0,
-            load_condition=LoadCondition.UNIAXIAL_BENDING
+            moment_x=total_load * 0.1,       # Moment due to eccentricity
+            moment_y=total_load * 0.05,      # Added Y-axis moment
+            shear_x=120.0,                   # Added lateral shear in X (kN)
+            shear_y=60.0,                    # Added lateral shear in Y (kN)
+            load_condition=LoadCondition.BIAXIAL_BENDING
         )
         
-        column_result = self.column_design.perform_complete_column_design(
-            column_loads, column_geometry, material_props
-        )
+        try :
+            column_result = self.column_design.perform_complete_column_design(
+                column_loads, column_geometry, material_props
+            )
+            
+            results['column'] = {
+                'geometry': column_geometry,
+                'loads': column_loads,
+                'design_result': column_result,
+                'summary': f"Column: {column_geometry.width}x{column_geometry.depth}mm, "
+                        f"Bars: {len(column_result.reinforcement.longitudinal_bars)}x{column_result.reinforcement.longitudinal_bars[0] if column_result.reinforcement.longitudinal_bars else 'N/A'}, "
+                        f"Ties: {column_result.reinforcement.tie_bars}@{column_result.reinforcement.tie_spacing:.0f}mm"
+            }
+        except Exception as e :
+            results['column'] = {'summary': f"Column Design FAILED: {str(e)}"}
         
-        results['column'] = {
-            'geometry': column_geometry,
-            'loads': column_loads,
-            'design_result': column_result,
-            'summary': f"Column: {column_geometry.width}x{column_geometry.depth}mm, "
-                      f"Bars: {len(column_result.reinforcement.longitudinal_bars)}x{column_result.reinforcement.longitudinal_bars[0] if column_result.reinforcement.longitudinal_bars else 'N/A'}, "
-                      f"Ties: {column_result.reinforcement.tie_bars}@{column_result.reinforcement.tie_spacing:.0f}mm"
-        }
-        
-        # 3. Slab Design (simplified to avoid calculation errors)
+        # 3. Slab Design (Now actually calling the library!)
         slab_geometry = SlabGeometry(
             length_x=span_mm,
             length_y=span_mm,
-            thickness=150,            # 150mm thick slab
+            thickness=200,            # Increased to 200mm to prevent punching shear failure
             cover=20,
-            effective_depth_x=125,
-            effective_depth_y=120,
+            effective_depth_x=170,
+            effective_depth_y=160,
             slab_type=SlabType.TWO_WAY_FLAT,
             support_conditions={
                 'x1': SupportCondition.CONTINUOUS,
@@ -249,16 +255,47 @@ class ACI318M25MemberLibrary:
             load_factors={'D': 1.4, 'L': 1.6}
         )
         
-        # Basic slab reinforcement (simplified)
-        min_steel_ratio = 0.0018  # Minimum for temperature and shrinkage
-        As_min = min_steel_ratio * slab_geometry.thickness * 1000  # mm²/m
-        
-        results['slab'] = {
-            'geometry': slab_geometry,
-            'loads': slab_loads,
-            'summary': f"Slab: {slab_geometry.thickness}mm thick, "
-                      f"Min reinforcement: {As_min:.0f} mm²/m (15M@200mm typ.)"
-        }
+        try:
+            # 1. Calculate average effective depth in meters
+            d_avg_m = ((slab_geometry.effective_depth_x + slab_geometry.effective_depth_y) / 2) / 1000.0
+            
+            # 2. Column dimensions in meters (assumed 400x400 from step 2)
+            col_w_m = 400.0 / 1000.0
+            col_d_m = 400.0 / 1000.0
+            
+            # 3. Critical perimeter area (column + d/2 on all sides)
+            critical_area_m2 = (col_w_m + d_avg_m) * (col_d_m + d_avg_m)
+            
+            # 4. Total tributary area of the slab panel
+            total_slab_area_m2 = (slab_geometry.length_x / 1000.0) * (slab_geometry.length_y / 1000.0)
+            
+            # 5. Area causing punching shear (total area minus the critical footprint)
+            punching_area_m2 = total_slab_area_m2 - critical_area_m2
+            
+            # 6. Factored area load (qu)
+            qu = (slab_loads.load_factors['D'] * slab_loads.dead_load) + \
+                 (slab_loads.load_factors['L'] * slab_loads.live_load)
+            
+            punching_force = qu * punching_area_m2
+                           
+            # Actually call the slab design module
+            slab_result = self.slab_design.perform_complete_slab_design(
+                geometry=slab_geometry, 
+                loads=slab_loads, 
+                material_props=material_props,
+                column_size=(400.0, 400.0) # Pass the column size for punching shear
+            )
+            
+            results['slab'] = {
+                'geometry': slab_geometry,
+                'loads': slab_loads,
+                'design_result': slab_result,
+                'summary': f"Slab: {slab_geometry.thickness}mm thick, "
+                          f"Main Bottom: {slab_result.reinforcement.main_bars_x}@{slab_result.reinforcement.main_spacing_x:.0f}mm, "
+                          f"Top: {slab_result.reinforcement.top_bars}@{slab_result.reinforcement.top_spacing:.0f}mm"
+            }
+        except Exception as e:
+            results['slab'] = {'summary': f"Slab Design FAILED: {str(e)}"}
         
         # 4. Footing Design
         footing_loads = FootingLoads(
@@ -280,16 +317,19 @@ class ACI318M25MemberLibrary:
             condition=SoilCondition.ALLOWABLE_STRESS
         )
         
-        footing_result = self.footing_design.perform_complete_footing_design(
-            footing_loads, soil_props, material_props
-        )
-        
-        results['footing'] = {
-            'loads': footing_loads,
-            'soil': soil_props,
-            'design_result': footing_result,
-            'summary': f"Footing: Based on {soil_props.bearing_capacity} kPa bearing capacity"
-        }
+        try :
+            footing_result = self.footing_design.perform_complete_footing_design(
+                footing_loads, soil_props, material_props
+            )
+            
+            results['footing'] = {
+                'loads': footing_loads,
+                'soil': soil_props,
+                'design_result': footing_result,
+                'summary': f"Footing: Based on {soil_props.bearing_capacity} kPa bearing capacity"
+            }
+        except Exception as e :
+            results['footing'] = {'summary': f"Footing Design FAILED: {str(e)}"}
         
         # 5. Shear Wall Design (if applicable)
         if building_height > 15.0:  # For taller buildings
@@ -309,24 +349,28 @@ class ACI318M25MemberLibrary:
             wall_loads = WallLoads(
                 axial_force=50,           # 50 kN/m from gravity
                 in_plane_shear=lateral_force,
+                in_plane_moment=25,
                 out_plane_moment=10,      # 10 kN⋅m/m out-of-plane
                 out_plane_shear=5,
                 lateral_pressure=2.0,     # 2 kPa wind pressure
                 load_type=LoadType.LATERAL_WIND
             )
             
-            wall_result = self.wall_design.perform_complete_wall_design(
-                wall_geometry, wall_loads, material_props
-            )
-            
-            results['wall'] = {
-                'geometry': wall_geometry,
-                'loads': wall_loads,
-                'design_result': wall_result,
-                'summary': f"Shear Wall: {wall_geometry.length}x{wall_geometry.thickness}mm, "
-                          f"Vert: {wall_result.reinforcement.vertical_bars}@{wall_result.reinforcement.vertical_spacing:.0f}mm, "
-                          f"Horiz: {wall_result.reinforcement.horizontal_bars}@{wall_result.reinforcement.horizontal_spacing:.0f}mm"
-            }
+            try :
+                wall_result = self.wall_design.perform_complete_wall_design(
+                    wall_geometry, wall_loads, material_props
+                )
+                
+                results['wall'] = {
+                    'geometry': wall_geometry,
+                    'loads': wall_loads,
+                    'design_result': wall_result,
+                    'summary': f"Shear Wall: {wall_geometry.length}x{wall_geometry.thickness}mm, "
+                            f"Vert: {wall_result.reinforcement.vertical_bars}@{wall_result.reinforcement.vertical_spacing:.0f}mm, "
+                            f"Horiz: {wall_result.reinforcement.horizontal_bars}@{wall_result.reinforcement.horizontal_spacing:.0f}mm"
+                }
+            except Exception as e :
+                results['wall'] = {'summary': f"Wall Design FAILED: {str(e)}"}
         
         # 6. Diaphragm Design
         diaphragm_geometry = DiaphragmGeometry(
@@ -355,24 +399,30 @@ class ACI318M25MemberLibrary:
             story_shear=diaphragm_force
         )
         
-        diaphragm_result = self.diaphragm_design.perform_complete_diaphragm_design(
-            diaphragm_geometry, diaphragm_loads, material_props
-        )
-        
-        results['diaphragm'] = {
-            'geometry': diaphragm_geometry,
-            'loads': diaphragm_loads,
-            'design_result': diaphragm_result,
-            'summary': f"Diaphragm: {diaphragm_geometry.thickness}mm thick, "
-                      f"{diaphragm_result.behavior_classification.value} behavior, "
-                      f"Main: {diaphragm_result.reinforcement.main_bars_x}@{diaphragm_result.reinforcement.main_spacing_x:.0f}mm"
-        }
+        try :
+            diaphragm_result = self.diaphragm_design.perform_complete_diaphragm_design(
+                diaphragm_geometry, diaphragm_loads, material_props
+            )
+            
+            results['diaphragm'] = {
+                'geometry': diaphragm_geometry,
+                'loads': diaphragm_loads,
+                'design_result': diaphragm_result,
+                'summary': f"Diaphragm: {diaphragm_geometry.thickness}mm thick, "
+                        f"{diaphragm_result.behavior_classification.value} behavior, "
+                        f"Main: {diaphragm_result.reinforcement.main_bars_x}@{diaphragm_result.reinforcement.main_spacing_x:.0f}mm"
+            }
+        except Exception as e :
+            results['diaphragm'] = {'summary': f"Diaphragm Design FAILED: {str(e)}"}
         
         return results
     
     def generate_design_summary_report(self, design_results: Dict[str, any],
                                      project_info: ProjectInfo) -> str:
         """Generate comprehensive design summary report"""
+        
+        # Fetch the active material properties so the report tells the truth
+        mat = self.create_standard_material_properties()
         
         report = f"""
 ╔══════════════════════════════════════════════════════════════════════════════════════╗
@@ -387,21 +437,13 @@ Project Name: {project_info.project_name}
 Location: {project_info.location}
 Date: {project_info.date}
 Engineer: {project_info.engineer}
-Client: {project_info.client}
-Description: {project_info.description}
-
-Design Standards:
-{'='*80}
-• ACI 318M-25: Building Code Requirements for Structural Concrete (International System of Units)
-• ACI 318RM-25: Commentary on Building Code Requirements for Structural Concrete
-• ASTM A615/A615M: Standard Specification for Deformed and Plain Carbon-Steel Bars
 
 Material Properties:
 {'='*80}
-• Concrete: fc' = 28.0 MPa (FC28)
-• Reinforcing Steel: fy = 420.0 MPa (Grade 420)
-• Steel Modulus: Es = 200,000 MPa
-• Concrete Modulus: Ec = 24,870 MPa
+• Concrete: fc' = {mat.fc_prime:.1f} MPa
+• Reinforcing Steel: fy = {mat.fy:.1f} MPa
+• Steel Modulus: Es = {mat.es:,.0f} MPa
+• Concrete Modulus: Ec = {mat.ec:,.0f} MPa
 
 Design Summary:
 {'='*80}"""
@@ -439,10 +481,21 @@ Design Verification:
         for member_type, result in design_results.items():
             if 'design_result' in result:
                 design_result = result['design_result']
+                
                 if hasattr(design_result, 'utilization_ratio'):
                     ratio = design_result.utilization_ratio
                     status = "PASS" if ratio <= 1.0 else "CHECK REQUIRED"
-                    report += f"\n• {member_type.upper()}: Utilization = {ratio:.2f} - {status}"
+                    report += f"\n• {member_type.upper()}: Governing Utilization = {ratio:.2f} - {status}"
+                    
+                    # Detailed breakdown for columns
+                    if member_type == 'column' and hasattr(design_result, 'shear_utilization_x'):
+                        pm_ratio = design_result.capacity.interaction_ratio
+                        vx_ratio = design_result.shear_utilization_x
+                        vy_ratio = design_result.shear_utilization_y
+                        
+                        report += f"\n    ↳ P-M Interaction Ratio : {pm_ratio:.2f}"
+                        report += f"\n    ↳ Shear Utilization (X) : {vx_ratio:.2f}"
+                        report += f"\n    ↳ Shear Utilization (Y) : {vy_ratio:.2f}"
         
         report += f"""
 

@@ -61,6 +61,7 @@ class WallLoads:
     """Wall loading conditions"""
     axial_force: float        # Factored axial force per unit length (kN/m)
     in_plane_shear: float     # Factored in-plane shear (kN)
+    in_plane_moment: float    # Factored in-plane moment (kN⋅m)  <-- ADDED
     out_plane_moment: float   # Factored out-of-plane moment (kN⋅m/m)
     out_plane_shear: float    # Factored out-of-plane shear (kN/m)
     lateral_pressure: float   # Lateral pressure (kPa)
@@ -122,7 +123,7 @@ class ACI318M25WallDesign:
             'horizontal_ratio': 0.0020,             # Horizontal reinforcement
             'max_spacing_vertical': 450,            # Maximum vertical bar spacing (mm)
             'max_spacing_horizontal': 450,          # Maximum horizontal bar spacing (mm)
-            'min_bar_size': '15M'                   # Minimum bar size
+            'min_bar_size': 'D16'                   # Minimum bar size
         }
         
         # Slenderness limits
@@ -184,41 +185,30 @@ class ACI318M25WallDesign:
                                material_props: MaterialProperties,
                                vertical_steel_ratio: float) -> float:
         """
-        Calculate axial capacity of wall
-        ACI 318M-25 Section 11.5.2
-        
-        Args:
-            geometry: Wall geometric properties
-            material_props: Material properties
-            vertical_steel_ratio: Ratio of vertical reinforcement
-            
-        Returns:
-            Axial capacity per unit length (kN/m)
+        Calculate axial capacity of wall per unit length
+        ACI 318M-25 Chapter 11
         """
         fc_prime = material_props.fc_prime
         fy = material_props.fy
         t = geometry.thickness
         
-        # Gross cross-sectional area per unit length
-        Ag = t * 1000  # mm²/m
+        # Gross cross-sectional area per meter length
+        Ag_per_m = t * 1000.0  # mm²/m
         
-        # Steel area per unit length
-        As = vertical_steel_ratio * Ag
-        
-        # Check slenderness effects
-        slenderness_factor = self._calculate_slenderness_factor(geometry)
-        
-        # Nominal axial capacity - ACI 318M-25 Eq. (11.5.2.1)
-        # For walls with slenderness effects
-        Pn_wall = 0.55 * fc_prime * Ag * (1 - (geometry.effective_length / (32 * t))**2) + As * fy
-        
-        # Apply slenderness factor
-        Pn_wall *= slenderness_factor
-        
-        # Convert to kN/m
-        Pn = Pn_wall / 1000
-        
-        return max(Pn, 0)
+        if geometry.wall_type == WallType.BEARING_WALL:
+            # Empirical design method - strictly NO steel contribution allowed
+            # Slenderness reduction term: [1 - (klc / 32h)^2]
+            slenderness_term = max(0.0, 1.0 - (geometry.effective_length / (32.0 * t))**2)
+            Pn_per_m = 0.55 * fc_prime * Ag_per_m * slenderness_term
+        else:
+            # For Shear Walls, treat as a tied compression member (column)
+            # NO empirical slenderness reduction is applied here.
+            As_per_m = vertical_steel_ratio * Ag_per_m
+            Po_per_m = 0.85 * fc_prime * (Ag_per_m - As_per_m) + fy * As_per_m
+            Pn_per_m = 0.80 * Po_per_m  # Maximum nominal strength for tied members
+            
+        # Convert N/m to kN/m
+        return max(Pn_per_m / 1000.0, 0.0)
     
     def calculate_shear_capacity(self, geometry: WallGeometry,
                                material_props: MaterialProperties,
@@ -226,31 +216,32 @@ class ACI318M25WallDesign:
         """
         Calculate in-plane shear capacity of wall
         ACI 318M-25 Section 11.5.4
-        
-        Args:
-            geometry: Wall geometric properties
-            material_props: Material properties
-            horizontal_steel_ratio: Ratio of horizontal reinforcement
-            
-        Returns:
-            Shear capacity (kN)
         """
         fc_prime = material_props.fc_prime
         fy = material_props.fy
         lw = geometry.length
+        hw = geometry.height
         t = geometry.thickness
         
         # Effective area
         Acv = lw * t  # mm²
         
-        # Concrete contribution to shear strength
+        # Determine concrete shear coefficient (alpha_c) based on aspect ratio
         if geometry.wall_type == WallType.SHEAR_WALL:
-            # For shear walls - ACI 318M-25 Section 11.5.4.6
-            alpha_c = 0.25  # Conservative value
-            Vc = alpha_c * math.sqrt(fc_prime) * Acv / 1000  # kN
+            hw_lw = hw / lw if lw > 0 else 2.0
+            
+            if hw_lw <= 1.5:
+                alpha_c = 0.25
+            elif hw_lw >= 2.0:
+                alpha_c = 0.17
+            else:
+                # Linear interpolation between 0.25 and 0.17
+                alpha_c = 0.25 - 0.08 * (hw_lw - 1.5) / 0.5
         else:
-            # For bearing walls
-            Vc = 0.17 * math.sqrt(fc_prime) * Acv / 1000  # kN
+            # Standard for regular bearing walls
+            alpha_c = 0.17  
+            
+        Vc = alpha_c * math.sqrt(fc_prime) * Acv / 1000  # kN
         
         # Steel contribution (horizontal reinforcement)
         As_h = horizontal_steel_ratio * Acv
@@ -310,125 +301,97 @@ class ACI318M25WallDesign:
         return phi * Mn
     
     def design_vertical_reinforcement(self, geometry: WallGeometry,
-                                    loads: WallLoads,
-                                    material_props: MaterialProperties) -> Tuple[str, float]:
-        """
-        Design vertical reinforcement for wall
-        
-        Args:
-            geometry: Wall geometric properties
-            loads: Wall loading conditions
-            material_props: Material properties
-            
-        Returns:
-            Tuple of (bar_size, spacing_mm)
-        """
-        fy = material_props.fy
-        
-        # Calculate required steel ratio
-        if loads.load_type == LoadType.GRAVITY_ONLY:
-            # Minimum reinforcement for gravity loads
-            if fy <= 420:
-                rho_required = self.min_reinforcement['vertical_ratio_grade420']
-            else:
-                rho_required = self.min_reinforcement['vertical_ratio_grade520']
-        else:
-            # Additional reinforcement for lateral loads
-            # Simplified approach - detailed analysis needed
-            additional_ratio = abs(loads.out_plane_moment) * 0.0001  # Simplified
-            if fy <= 420:
-                rho_required = self.min_reinforcement['vertical_ratio_grade420'] + additional_ratio
-            else:
-                rho_required = self.min_reinforcement['vertical_ratio_grade520'] + additional_ratio
-        
-        # Calculate required area per unit length
-        As_required = rho_required * geometry.thickness * 1000  # mm²/m
-        
-        # Select bar size and spacing
-        return self._select_wall_reinforcement(As_required, 'vertical')
-    
-    def design_horizontal_reinforcement(self, geometry: WallGeometry,
                                       loads: WallLoads,
                                       material_props: MaterialProperties) -> Tuple[str, float]:
-        """
-        Design horizontal reinforcement for wall
-        
-        Args:
-            geometry: Wall geometric properties
-            loads: Wall loading conditions
-            material_props: Material properties
-            
-        Returns:
-            Tuple of (bar_size, spacing_mm)
-        """
+        """Design vertical reinforcement for wall including out-of-plane flexure"""
         fy = material_props.fy
+        fc_prime = material_props.fc_prime
+        t = geometry.thickness
+        d = t - geometry.cover - 10  # approximate effective depth
+        b = 1000  # per meter width
         
-        # Minimum horizontal reinforcement - ACI 318M-25 Section 11.6.2
+        # Base minimum reinforcement
+        base_ratio = self.min_reinforcement['vertical_ratio_grade420'] if fy <= 420 else self.min_reinforcement['vertical_ratio_grade520']
+        As_min = base_ratio * t * b
+        As_required = As_min
+        
+        if loads.load_type != LoadType.GRAVITY_ONLY and loads.out_plane_moment > 0:
+            Mu = loads.out_plane_moment * 1e6  # N-mm
+            phi = self.phi_factors['flexure']
+            
+            # Corrected flexural quadratic formula
+            A = phi * fy**2 / (2 * 0.85 * fc_prime * b)
+            B = -phi * fy * d
+            C = Mu
+            
+            discriminant = B**2 - 4*A*C
+            if discriminant < 0:
+                raise ValueError("Wall thickness inadequate for applied out-of-plane moment")
+                
+            As_moment = (-B - math.sqrt(discriminant)) / (2*A)
+            As_required = max(As_min, As_moment)
+            
+        return self._select_wall_reinforcement(As_required, 'vertical', fy, t, geometry.cover)
+    
+    def design_horizontal_reinforcement(self, geometry: WallGeometry,
+                                        loads: WallLoads,
+                                        material_props: MaterialProperties) -> Tuple[str, float]:
+        """Design horizontal reinforcement for wall"""
+        fy = material_props.fy
         rho_min = self.min_reinforcement['horizontal_ratio']
         
-        # Additional reinforcement for shear if required
         if loads.in_plane_shear > 0:
-            # Calculate additional steel for shear
             Vu = loads.in_plane_shear
             fc_prime = material_props.fc_prime
             Acv = geometry.length * geometry.thickness
             
-            # Concrete shear strength
-            Vc = 0.17 * math.sqrt(fc_prime) * Acv / 1000  # kN
-            
-            # Required steel shear strength
+            Vc = 0.17 * math.sqrt(fc_prime) * Acv / 1000
             Vs_required = max(0, Vu / self.phi_factors['shear'] - Vc)
             
-            # Required horizontal steel area
-            As_shear = Vs_required * 1000 / fy  # mm²
+            As_shear = Vs_required * 1000 / fy  
             As_shear_ratio = As_shear / Acv
-            
             rho_required = max(rho_min, As_shear_ratio)
         else:
             rho_required = rho_min
+            
+        As_required = rho_required * geometry.thickness * 1000  
         
-        # Calculate required area per unit length
-        As_required = rho_required * geometry.thickness * 1000  # mm²/m
-        
-        # Select bar size and spacing
-        return self._select_wall_reinforcement(As_required, 'horizontal')
+        return self._select_wall_reinforcement(As_required, 'horizontal', fy, geometry.thickness, geometry.cover)
     
     def check_boundary_elements(self, geometry: WallGeometry,
                               loads: WallLoads,
                               material_props: MaterialProperties) -> bool:
         """
-        Check if boundary elements are required
-        ACI 318M-25 Section 18.10.6
-        
-        Args:
-            geometry: Wall geometric properties
-            loads: Wall loading conditions
-            material_props: Material properties
-            
-        Returns:
-            True if boundary elements required
+        Check if boundary elements are required using extreme fiber compressive stress
+        ACI 318M-25 Section 18.10.6.3
         """
         if geometry.wall_type != WallType.SHEAR_WALL:
             return False
         
         if loads.load_type not in [LoadType.LATERAL_SEISMIC, LoadType.COMBINED]:
             return False
-        
-        # Simplified check - detailed analysis needed
-        # Check compression strain and neutral axis location
-        
-        # Estimate neutral axis location
-        P = loads.axial_force * geometry.length  # Total axial force
-        M = loads.out_plane_moment * geometry.length  # Total moment
-        
-        if M > 0:
-            # Estimate c/lw ratio
-            c_lw_ratio = P / (0.85 * material_props.fc_prime * geometry.thickness * geometry.length)
             
-            if c_lw_ratio > self.boundary_requirements['neutral_axis_limit']:
-                return True
+        # If the user hasn't provided an in-plane moment, we can't properly check
+        if not hasattr(loads, 'in_plane_moment') or loads.in_plane_moment == 0:
+            return False
         
-        # Additional checks based on displacement ductility (simplified)
+        # Gross properties of the entire wall section
+        Ag = geometry.thickness * geometry.length  # mm²
+        Ig = (geometry.thickness * geometry.length**3) / 12.0  # mm⁴
+        yt = geometry.length / 2.0  # Distance to extreme fiber (mm)
+        
+        # Convert loads to standard N and N-mm
+        # loads.axial_force is kN/m. (kN/m) * mm = N
+        P_N = loads.axial_force * geometry.length  
+        M_Nmm = loads.in_plane_moment * 1e6
+        
+        # Extreme fiber compressive stress: f_c = P/A + M*y/I
+        stress = (P_N / Ag) + (M_Nmm * yt / Ig)
+        
+        # ACI 318 limit for boundary elements: stress > 0.2 * fc'
+        if stress > 0.2 * material_props.fc_prime:
+            return True
+            
         return False
     
     def _calculate_slenderness_factor(self, geometry: WallGeometry) -> float:
@@ -453,29 +416,40 @@ class ACI318M25WallDesign:
             # Simplified reduction factor
             return max(0.5, 1.0 - (klu_r - limit) / (2 * limit))
     
-    def _select_wall_reinforcement(self, As_required: float, 
-                                 direction: str) -> Tuple[str, float]:
+    def _select_wall_reinforcement(self, As_required: float, direction: str,
+                                   fy: float, thickness: float, cover: float,
+                                   aggregate_size: float = 25.0) -> Tuple[str, float]:
         """Select appropriate bar size and spacing for wall"""
-        # Common wall bar sizes
-        bar_sizes = ['10M', '15M', '20M', '25M']
+        bar_sizes = ['D10', 'D12', 'D16', 'D20', 'D25']
+        
+        # Calculate maximum spacing for crack control (ACI 318M-25 Sec. 24.3.2)
+        fs = (2.0 / 3.0) * fy
+        s_limit_1 = 380 * (280 / fs) - 2.5 * cover
+        s_limit_2 = 300 * (280 / fs)
+        max_crack_spacing = min(s_limit_1, s_limit_2)
+        
+        # General wall maximum spacing limit (ACI 318M-25 Sec. 11.7.2.1 / 11.7.3.1)
+        if direction == 'vertical':
+            max_general_spacing = min(3 * thickness, self.min_reinforcement['max_spacing_vertical'])
+        else:
+            max_general_spacing = min(3 * thickness, self.min_reinforcement['max_spacing_horizontal'])
+            
+        max_spacing = min(max_crack_spacing, max_general_spacing)
         
         for bar_size in bar_sizes:
             bar_area = self.aci.get_bar_area(bar_size)
-            spacing = bar_area * 1000 / As_required  # Spacing for 1m length
+            db = self.aci.get_bar_diameter(bar_size)
             
-            # Check spacing limits
-            if direction == 'vertical':
-                max_spacing = self.min_reinforcement['max_spacing_vertical']
-            else:
-                max_spacing = self.min_reinforcement['max_spacing_horizontal']
+            spacing = bar_area * 1000 / As_required 
             
-            min_spacing = 75  # Minimum practical spacing
+            # Minimum clear spacing limits
+            min_clear_spacing = max(25.0, db, (4.0/3.0) * aggregate_size)
+            min_c2c_spacing = min_clear_spacing + db
             
-            if min_spacing <= spacing <= max_spacing:
+            if min_c2c_spacing <= spacing <= max_spacing:
                 return bar_size, spacing
         
-        # If no suitable spacing, use maximum allowed
-        bar_size = '15M'
+        bar_size = 'D12'
         bar_area = self.aci.get_bar_area(bar_size)
         spacing = min(max_spacing, bar_area * 1000 / As_required)
         
@@ -515,17 +489,23 @@ class ACI318M25WallDesign:
         shear_capacity = self.calculate_shear_capacity(geometry, material_props, horiz_steel_ratio)
         moment_capacity = self.calculate_out_of_plane_moment_capacity(geometry, material_props, vert_steel_ratio)
         
-        # Buckling capacity (simplified)
-        slenderness_factor = self._calculate_slenderness_factor(geometry)
-        buckling_capacity = axial_capacity * slenderness_factor
+        # Buckling capacity
+        if geometry.wall_type == WallType.BEARING_WALL:
+            # The empirical method inside calculate_axial_capacity already applies the slenderness reduction
+            buckling_capacity = axial_capacity
+            slenderness_factor = 1.0 # Reset for the subsequent stability check logic to prevent a double penalty
+        else:
+            # For shear walls treated as compression members, apply macroscopic buckling reduction here
+            slenderness_factor = self._calculate_slenderness_factor(geometry)
+            buckling_capacity = axial_capacity * slenderness_factor
         
         # Check boundary elements
         boundary_required = self.check_boundary_elements(geometry, loads, material_props)
         
         # Design boundary elements if required
         if boundary_required:
-            boundary_bars = '25M'  # Simplified
-            boundary_ties = '10M'
+            boundary_bars = 'D20'  # Simplified
+            boundary_ties = 'D10'
             tie_spacing = 100.0    # Close spacing for confinement
             design_notes.append("Boundary elements required for seismic design")
         else:

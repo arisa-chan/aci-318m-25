@@ -21,23 +21,24 @@ from enum import Enum
 
 class ConcreteStrengthClass(Enum):
     """Concrete strength classes according to ACI 318M-25"""
-    FC14 = "14"    # 14 MPa
-    FC17 = "17"    # 17 MPa
-    FC21 = "21"    # 21 MPa
-    FC28 = "28"    # 28 MPa
-    FC35 = "35"    # 35 MPa
-    FC42 = "42"    # 42 MPa
-    FC50 = "50"    # 50 MPa
-    FC55 = "55"    # 55 MPa
+    FC14 = "13.8"    # 14 MPa
+    FC17 = "17.3"    # 17 MPa
+    FC21 = "20.7"    # 21 MPa
+    FC28 = "27.6"    # 28 MPa
+    FC35 = "34.5"    # 35 MPa
+    FC42 = "41.4"    # 42 MPa
+    FC50 = "48.3"    # 50 MPa
+    FC55 = "55.2"    # 55 MPa
     FC70 = "70"    # 70 MPa
     FC80 = "80"    # 80 MPa
     FC100 = "100"  # 100 MPa
 
 class ReinforcementGrade(Enum):
     """Reinforcement grades according to ASTM standards used in ACI 318M-25"""
-    GRADE280 = "280"   # Grade 280 (40 ksi) - fy = 280 MPa
-    GRADE420 = "420"   # Grade 420 (60 ksi) - fy = 420 MPa
+    GRADE280 = "276"   # Grade 280 (40 ksi) - fy = 280 MPa
+    GRADE420 = "415"   # Grade 420 (60 ksi) - fy = 420 MPa
     GRADE520 = "520"   # Grade 520 (75 ksi) - fy = 520 MPa
+    GRADE550 = "550"   # Grade 520 (80 ksi) - fy = 550 MPa
 
 class ExposureCondition(Enum):
     """Exposure conditions for durability requirements - ACI 318M-25 Table 19.3.1.1"""
@@ -191,33 +192,30 @@ class ACI318M25:
                 'grade_designation': 'Grade 520 (75 ksi)',
                 'astm_specification': 'ASTM A615/A615M',
                 'usage': 'High-strength applications'
+            },
+            # --- ADDED GRADE 550 ---
+            ReinforcementGrade.GRADE550: {
+                'fy': 550.0,      # Yield strength (MPa)
+                'fu': 725.0,      # Tensile strength (MPa) (approximate for Gr 80)
+                'es': 200000.0,   # Modulus of elasticity (MPa)
+                'grade_designation': 'Grade 550 (80 ksi)',
+                'astm_specification': 'ASTM A615/A615M',
+                'usage': 'High-strength structural applications'
             }
         }
         
-        # Standard reinforcing bar sizes (metric) - ACI 318M-25 Table 25.3.1
+        # Standard reinforcing bar sizes (PNS 49)
         self.bar_areas = {
-            # Metric bar designations
-            '10M': {'diameter': 11.3, 'area': 100},     # 10M bar - 100 mm²
-            '15M': {'diameter': 16.0, 'area': 200},     # 15M bar - 200 mm²
-            '20M': {'diameter': 19.5, 'area': 300},     # 20M bar - 300 mm²
-            '25M': {'diameter': 25.2, 'area': 500},     # 25M bar - 500 mm²
-            '30M': {'diameter': 29.9, 'area': 700},     # 30M bar - 700 mm²
-            '35M': {'diameter': 35.7, 'area': 1000},    # 35M bar - 1000 mm²
-            '45M': {'diameter': 43.7, 'area': 1500},    # 45M bar - 1500 mm²
-            '55M': {'diameter': 56.4, 'area': 2500},    # 55M bar - 2500 mm²
-            
-            # Imperial bar designations (for reference)
-            '#3': {'diameter': 9.5, 'area': 71},        # #3 bar - 71 mm²
-            '#4': {'diameter': 12.7, 'area': 129},      # #4 bar - 129 mm²
-            '#5': {'diameter': 15.9, 'area': 200},      # #5 bar - 200 mm²
-            '#6': {'diameter': 19.1, 'area': 284},      # #6 bar - 284 mm²
-            '#7': {'diameter': 22.2, 'area': 387},      # #7 bar - 387 mm²
-            '#8': {'diameter': 25.4, 'area': 510},      # #8 bar - 510 mm²
-            '#9': {'diameter': 28.7, 'area': 645},      # #9 bar - 645 mm²
-            '#10': {'diameter': 32.3, 'area': 819},     # #10 bar - 819 mm²
-            '#11': {'diameter': 35.8, 'area': 1006},    # #11 bar - 1006 mm²
-            '#14': {'diameter': 43.0, 'area': 1452},    # #14 bar - 1452 mm²
-            '#18': {'diameter': 57.3, 'area': 2581}     # #18 bar - 2581 mm²
+            'D10': {'diameter': 10.0, 'area': 78.54},
+            'D12': {'diameter': 12.0, 'area': 113.10},
+            'D16': {'diameter': 16.0, 'area': 201.06},
+            'D20': {'diameter': 20.0, 'area': 314.16},
+            'D25': {'diameter': 25.0, 'area': 490.87},
+            'D28': {'diameter': 28.0, 'area': 615.75},
+            'D32': {'diameter': 32.0, 'area': 804.25},
+            'D36': {'diameter': 36.0, 'area': 1017.88},
+            'D40': {'diameter': 40.0, 'area': 1256.64},
+            'D50': {'diameter': 50.0, 'area': 1963.50}
         }
         
         # Concrete cover requirements - ACI 318M-25 Table 20.5.1.3.1
@@ -381,15 +379,13 @@ class ACI318M25:
         Returns:
             Ec: Modulus of elasticity (MPa)
         """
-        # ACI 318M-25 Eq. (19.2.2.1b): Ec = γc^1.5 × 0.043 × √fc'
-        # For normal weight concrete (γc = 24 kN/m³), this simplifies to Ec = 4700√fc'
-        
         if gamma_c == 24.0:
-            # Simplified equation for normal weight concrete
+            # Simplified equation for standard normal weight concrete
             ec = 4700 * math.sqrt(fc_prime) * lambda_factor
         else:
-            # General equation
-            ec = (gamma_c ** 1.5) * 0.043 * math.sqrt(fc_prime) * lambda_factor
+            # Convert gamma_c from kN/m³ to kg/m³ (multiplier approx. 101.97)
+            w_c = gamma_c * 101.9716
+            ec = (w_c ** 1.5) * 0.043 * math.sqrt(fc_prime) * lambda_factor
         
         return ec
 
@@ -482,23 +478,11 @@ class ACI318M25:
                                    modification_factors: Dict = None) -> float:
         """
         Calculate development length for reinforcing bars - ACI 318M-25 Section 25.4
-        
-        Args:
-            bar_size: Bar size designation
-            fc_prime: Specified compressive strength (MPa)
-            fy: Specified yield strength (MPa)
-            modification_factors: Dictionary of modification factors
-            
-        Returns:
-            Development length (mm)
         """
         if bar_size not in self.bar_areas:
             raise ValueError(f"Unknown bar size: {bar_size}")
         
-        db = self.bar_areas[bar_size]['diameter']  # Bar diameter (mm)
-        
-        # Basic development length - ACI 318M-25 Eq. (25.4.2.3a)
-        # ld = (fy × ψt × ψe × ψs × λ) / (25 × λ × √fc') × db
+        db = self.bar_areas[bar_size]['diameter']
         
         # Default modification factors
         psi_t = modification_factors.get('top_bar', 1.0) if modification_factors else 1.0
@@ -512,8 +496,8 @@ class ACI318M25:
         
         ld = (numerator / denominator) * db
         
-        # Minimum development length
-        ld_min = max(300, 12 * db)  # 300 mm or 12db, whichever is greater
+        # Minimum development length is universally 300 mm for straight bars in tension
+        ld_min = 300.0
         
         return max(ld, ld_min)
 
@@ -587,11 +571,17 @@ class ACI318M25:
         Returns:
             ρmax: Maximum reinforcement ratio for tension-controlled behavior
         """
-        # For tension-controlled behavior, net tensile strain ≥ 0.005
-        rho_b = self.calculate_balanced_reinforcement_ratio(fc_prime, fy)
-        
-        # Maximum reinforcement ratio (approximately 75% of balanced)
-        rho_max = 0.75 * rho_b
+        # Calculate β1 - ACI 318M-25 Section 22.2.2.4.3
+        if fc_prime <= 28:
+            beta1 = 0.85
+        elif fc_prime <= 55:
+            beta1 = 0.85 - 0.05 * (fc_prime - 28) / 7
+        else:
+            beta1 = 0.65
+            
+        # For tension-controlled behavior, net tensile strain >= 0.005
+        # This simplifies to 3/8 * (0.85 * fc' * beta1 / fy)
+        rho_max = (3.0 / 8.0) * 0.85 * fc_prime * beta1 / fy
         
         return rho_max
 
@@ -676,42 +666,37 @@ class ACI318M25:
         fr = 0.62 * lambda_factor * math.sqrt(fc_prime)
         return fr
 
-    def check_crack_control(self, fs: float, dc: float, A: float, s: float = None) -> Dict:
+    def check_crack_control(self, fy: float, cc: float, fs: float = None) -> Dict:
         """
-        Check crack control requirements - ACI 318M-25 Section 24.3.2
+        Calculate maximum spacing of reinforcement for crack control.
+        ACI 318M-25 Section 24.3.2
         
         Args:
-            fs: Stress in reinforcement at service loads (MPa)
-            dc: Thickness of concrete cover (mm)
-            A: Area of concrete per bar (mm²)
-            s: Bar spacing (mm, optional)
+            fy: Specified yield strength (MPa)
+            cc: Clear cover from the nearest surface in tension to the surface 
+                of the flexural tension reinforcement (mm)
+            fs: Calculated stress in reinforcement at service loads (MPa). 
+                If None, 2/3 fy is used per ACI 318.
             
         Returns:
-            Dictionary with crack control results
+            Dictionary with crack control spacing limits
         """
-        # ACI 318M-25 simplified approach
-        # Service stress limitation: fs ≤ 0.6fy for crack control
+        if fs is None:
+            fs = (2.0 / 3.0) * fy
+            
+        # ACI 318M-25 maximum spacing equations
+        s_limit_1 = 380 * (280 / fs) - 2.5 * cc
+        s_limit_2 = 300 * (280 / fs)
         
-        # Calculate parameter for crack control
-        z = fs * (dc * A) ** (1/3)  # Crack control parameter
+        max_spacing = min(s_limit_1, s_limit_2)
         
-        # Limits based on exposure
-        z_limit_interior = 30000  # N/mm for interior exposure
-        z_limit_exterior = 25000  # N/mm for exterior exposure
-        
-        results = {
-            'stress_mpa': fs,
-            'cover_mm': dc,
-            'area_per_bar_mm2': A,
-            'z_parameter': z,
-            'z_limit_interior': z_limit_interior,
-            'z_limit_exterior': z_limit_exterior,
-            'interior_ok': z <= z_limit_interior,
-            'exterior_ok': z <= z_limit_exterior,
-            'spacing_mm': s
+        return {
+            'steel_stress_mpa': fs,
+            'clear_cover_mm': cc,
+            's_limit_1_mm': s_limit_1,
+            's_limit_2_mm': s_limit_2,
+            'max_spacing_mm': max_spacing
         }
-        
-        return results
 
     def get_material_properties(self, concrete_class: ConcreteStrengthClass, 
                               steel_grade: ReinforcementGrade) -> MaterialProperties:
