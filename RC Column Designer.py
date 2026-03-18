@@ -1,4 +1,4 @@
-import FreeSimpleGUIQt as sg
+import FreeSimpleGUI as sg
 import math
 
 # Import your custom ACI backend libraries
