@@ -67,6 +67,8 @@ class FootingLoads:
     service_axial: float      # Service axial load for bearing check (kN)
     service_moment_x: float   # Service moment x for bearing check (kN⋅m)
     service_moment_y: float   # Service moment y for bearing check (kN⋅m)
+    eccentricity_x: float = 0.0  # Eccentricity x of column from footing center (mm)
+    eccentricity_y: float = 0.0  # Eccentricity y of column from footing center (mm)
 
 @dataclass
 class FootingReinforcement:
@@ -91,6 +93,9 @@ class FootingAnalysisResult:
     reinforcement: FootingReinforcement
     utilization_ratio: float # Maximum utilization ratio
     design_notes: List[str]   # Design notes and warnings
+    final_length: float       # Final footing length (mm)
+    final_width: float        # Final footing width (mm)
+    final_thickness: float    # Final footing thickness (mm)
 
 class ACI318M25FootingDesign:
     """
@@ -456,7 +461,8 @@ class ACI318M25FootingDesign:
             db = self.aci.get_bar_diameter(bar_size)
             
             # Theoretical required spacing to meet area
-            spacing = bar_area * width / As_required
+            raw_spacing = bar_area * width / As_required
+            spacing = self._round_spacing(raw_spacing)
             
             # Minimum clear spacing limits (ACI 318M-25 Sec. 25.2.1)
             min_clear_spacing = max(25.0, db, (4.0/3.0) * aggregate_size)
@@ -468,8 +474,15 @@ class ACI318M25FootingDesign:
         # If no suitable spacing is found, use a standard default with maximum allowable spacing
         bar_size = 'D20'
         bar_area = self.aci.get_bar_area(bar_size)
-        spacing = min(max_spacing, bar_area * width / As_required)
-        
+        raw_spacing = bar_area * width / As_required
+        spacing = self._round_spacing(min(max_spacing, raw_spacing))
+
+        # Ensure spacing meets minimum requirements
+        min_clear_spacing = max(25.0, self.aci.get_bar_diameter(bar_size), (4.0/3.0) * aggregate_size)
+        min_c2c_spacing = min_clear_spacing + self.aci.get_bar_diameter(bar_size)
+        if spacing < min_c2c_spacing:
+            spacing = min_c2c_spacing
+
         return bar_size, spacing
     
     def _design_column_dowels(self, geometry: FootingGeometry,
@@ -501,12 +514,24 @@ class ACI318M25FootingDesign:
         else:
             return 'D36'
     
+    def _round_len_width(self, value: float) -> float:
+        """Round length/width up to nearest 100 mm."""
+        return math.ceil(value / 100.0) * 100.0
+
+    def _round_thickness(self, value: float) -> float:
+        """Round thickness up to nearest 50 mm."""
+        return math.ceil(value / 50.0) * 50.0
+
+    def _round_spacing(self, value: float) -> float:
+        """Round reinforcement spacing down to nearest 25 mm (minimum 25 mm)."""
+        return max(25.0, math.floor(value / 25.0) * 25.0)
+
     def perform_complete_footing_design(self, loads: FootingLoads,
                                       soil_props: SoilProperties,
                                       material_props: MaterialProperties,
                                       initial_geometry: FootingGeometry = None) -> FootingAnalysisResult:
         """
-        Perform complete footing design analysis
+        Perform complete footing design analysis with automatic size adjustment until utilization ≤ 1.0.
         
         Args:
             loads: Footing load conditions
@@ -517,75 +542,121 @@ class ACI318M25FootingDesign:
         Returns:
             Complete footing analysis results
         """
-        design_notes = []
-        
-        # Size footing for bearing capacity if not provided
+        # Determine initial geometry
         if initial_geometry is None:
             req_length, req_width = self.calculate_required_footing_area(loads, soil_props)
-            
-            # Round up to practical dimensions
-            length = math.ceil(req_length / 100) * 100  # Round to nearest 100mm
-            width = math.ceil(req_width / 100) * 100
-            
-            # Estimate thickness (simplified)
+            length = self._round_len_width(req_length)
+            width = self._round_len_width(req_width)
             thickness = max(length / 10, width / 10, self.design_constants['min_footing_thickness'])
-            thickness = math.ceil(thickness / 50) * 50  # Round to nearest 50mm
-            
+            thickness = self._round_thickness(thickness)
             geometry = FootingGeometry(
                 length=length,
                 width=width,
                 thickness=thickness,
-                cover=75,  # Standard footing cover
-                column_width=400,  # Assumed
-                column_depth=400,  # Assumed
+                cover=75,
+                column_width=400,
+                column_depth=400,
                 footing_type=FootingType.ISOLATED_SQUARE
             )
         else:
             geometry = initial_geometry
-        
-        # Check bearing pressure
-        qmax, qmin, no_tension = self.calculate_bearing_pressure(geometry, loads)
-        bearing_ok = qmax <= soil_props.bearing_capacity and no_tension
-        
-        if not bearing_ok:
-            if qmax > soil_props.bearing_capacity:
-                design_notes.append(f"Bearing pressure {qmax:.1f} kPa exceeds capacity {soil_props.bearing_capacity:.1f} kPa")
-            if not no_tension:
-                design_notes.append("Tension exists under footing - increase size or revise loading")
-        
-        # Check shear
-        one_way_ok, one_way_ratio = self.check_one_way_shear(geometry, loads, material_props)
-        two_way_ok, two_way_ratio = self.check_two_way_shear(geometry, loads, material_props)
-        
-        if not one_way_ok:
-            design_notes.append(f"One-way shear inadequate (ratio = {one_way_ratio:.2f})")
-        
-        if not two_way_ok:
-            design_notes.append(f"Two-way shear inadequate (ratio = {two_way_ratio:.2f})")
-        
-        # Design reinforcement
-        reinforcement = self.design_flexural_reinforcement(geometry, loads, material_props)
-        
-        # Calculate overall utilization
-        utilization_ratio = max(
-            qmax / soil_props.bearing_capacity if soil_props.bearing_capacity > 0 else 0,
-            one_way_ratio,
-            two_way_ratio
-        )
-        
-        # Additional design notes
-        if geometry.thickness < self.design_constants['min_footing_thickness']:
-            design_notes.append(f"Increase thickness to minimum {self.design_constants['min_footing_thickness']}mm")
-        
-        if reinforcement.development_length > (geometry.length - geometry.column_width) / 2 - geometry.cover:
-            design_notes.append("Development length may be inadequate - consider hooks or larger footing")
-        
-        return FootingAnalysisResult(
-            bearing_pressure=qmax,
-            bearing_ok=bearing_ok,
-            one_way_shear_ok=one_way_ok,
-            two_way_shear_ok=two_way_ok,
-            reinforcement=reinforcement,
-            utilization_ratio=utilization_ratio,
-            design_notes=design_notes
-        )
+
+        max_iterations = 20
+        result = None
+        design_notes = []
+
+        for iteration in range(max_iterations):
+            # Bearing pressure check
+            qmax, qmin, no_tension = self.calculate_bearing_pressure(geometry, loads)
+            bearing_ok = qmax <= soil_props.bearing_capacity and no_tension
+
+            # Shear checks
+            one_way_ok, one_way_ratio = self.check_one_way_shear(geometry, loads, material_props)
+            two_way_ok, two_way_ratio = self.check_two_way_shear(geometry, loads, material_props)
+
+            # Reinforcement design (may fail if section too small for moment)
+            try:
+                reinforcement = self.design_flexural_reinforcement(geometry, loads, material_props)
+            except ValueError as e:
+                # Section inadequate for flexure; increase size and continue
+                design_notes = [f"Iteration {iteration+1}: Flexure design failed ({str(e)}). Increasing footing size."]
+                geometry = FootingGeometry(
+                    length=self._round_len_width(max(geometry.length * 1.1, geometry.length + 100)),
+                    width=self._round_len_width(max(geometry.width * 1.1, geometry.width + 100)),
+                    thickness=self._round_thickness(max(geometry.thickness * 1.1, geometry.thickness + 50)),
+                    cover=geometry.cover,
+                    column_width=geometry.column_width,
+                    column_depth=geometry.column_depth,
+                    footing_type=geometry.footing_type
+                )
+                continue
+
+            # Overall utilization
+            utilization_ratio = max(
+                qmax / soil_props.bearing_capacity if soil_props.bearing_capacity > 0 else 0,
+                one_way_ratio,
+                two_way_ratio
+            )
+
+            # Build design notes for this iteration
+            design_notes = []
+            if not bearing_ok:
+                if qmax > soil_props.bearing_capacity:
+                    design_notes.append(f"Bearing pressure {qmax:.1f} kPa exceeds capacity {soil_props.bearing_capacity:.1f} kPa")
+                if not no_tension:
+                    design_notes.append("Tension exists under footing - increase size or revise loading")
+            if not one_way_ok:
+                design_notes.append(f"One-way shear inadequate (ratio = {one_way_ratio:.2f})")
+            if not two_way_ok:
+                design_notes.append(f"Two-way shear inadequate (ratio = {two_way_ratio:.2f})")
+            if geometry.thickness < self.design_constants['min_footing_thickness']:
+                design_notes.append(f"Increase thickness to minimum {self.design_constants['min_footing_thickness']}mm")
+            if reinforcement.development_length > (geometry.length - geometry.column_width) / 2 - geometry.cover:
+                design_notes.append("Development length may be inadequate - consider hooks or larger footing")
+
+            # Check if design is adequate
+            if utilization_ratio <= 1.0:
+                result = FootingAnalysisResult(
+                    bearing_pressure=qmax,
+                    bearing_ok=bearing_ok,
+                    one_way_shear_ok=one_way_ok,
+                    two_way_shear_ok=two_way_ok,
+                    reinforcement=reinforcement,
+                    utilization_ratio=utilization_ratio,
+                    design_notes=design_notes,
+                    final_length=geometry.length,
+                    final_width=geometry.width,
+                    final_thickness=geometry.thickness
+                )
+                break
+
+            # Not adequate; increase footing size and iterate
+            new_length = self._round_len_width(max(geometry.length * 1.1, geometry.length + 100))
+            new_width = self._round_len_width(max(geometry.width * 1.1, geometry.width + 100))
+            new_thickness = self._round_thickness(max(geometry.thickness * 1.1, geometry.thickness + 50))
+            geometry = FootingGeometry(
+                length=new_length,
+                width=new_width,
+                thickness=new_thickness,
+                cover=geometry.cover,
+                column_width=geometry.column_width,
+                column_depth=geometry.column_depth,
+                footing_type=geometry.footing_type
+            )
+        else:
+            # Max iterations reached without achieving utilization ≤ 1.0
+            design_notes.append("Warning: Maximum iterations reached without achieving utilization ≤ 1.0")
+            result = FootingAnalysisResult(
+                bearing_pressure=qmax,
+                bearing_ok=bearing_ok,
+                one_way_shear_ok=one_way_ok,
+                two_way_shear_ok=two_way_ok,
+                reinforcement=reinforcement,
+                utilization_ratio=utilization_ratio,
+                design_notes=design_notes,
+                final_length=geometry.length,
+                final_width=geometry.width,
+                final_thickness=geometry.thickness
+            )
+
+        return result
