@@ -1,3 +1,4 @@
+# %%
 import math
 import re
 import FreeSimpleGUI as sg
@@ -15,7 +16,7 @@ def get_bar_diameter(bar_str):
     return int(match.group()) if match else 10
 
 def draw_cross_section(graph, beam, reinf):
-    """Draws the beam concrete, stirrups, and longitudinal bars onto the graph canvas"""
+    """Draws the beam concrete, stirrups, flexural bars, and torsion side-bars"""
     graph.erase()
     if not beam or not reinf: 
         return
@@ -45,28 +46,29 @@ def draw_cross_section(graph, beam, reinf):
         c_s = cover * scale
         graph.draw_rectangle((xl + c_s, yt - c_s), (xr - c_s, yb + c_s), fill_color=None, line_color='blue', line_width=3)
     
-    # Helper to draw layered bars
+    # Helper to draw layered flexural bars
     def draw_bar_layers(bar_list, is_top=False):
-        if not bar_list: return
+        if not bar_list: return 0
         d_bar = get_bar_diameter(bar_list[0])
         num_bars = len(bar_list)
         
         avail_w = W - 2 * cover - 2 * d_tie
         min_spc = max(25.0, d_bar)
         
-        # Calculate how many bars fit safely in one layer
         max_per_layer = max(2, math.floor((avail_w + min_spc) / (d_bar + min_spc)))
         
         bars_drawn = 0
         layer = 0
         color = 'darkgreen' if is_top else 'red'
+        last_y_center = 0
         
         while bars_drawn < num_bars:
             bars_in_this_layer = min(max_per_layer, num_bars - bars_drawn)
             
-            # Y-coordinate calculation (Bottom vs Top)
+            # Y-coordinate calculation
             offset = cover + d_tie + (d_bar / 2) + layer * (d_bar + 25.0)
             y_center = (yt - offset * scale) if is_top else (yb + offset * scale)
+            last_y_center = y_center
             
             # X-coordinate distribution
             if bars_in_this_layer == 1:
@@ -82,12 +84,43 @@ def draw_cross_section(graph, beam, reinf):
             
             bars_drawn += bars_in_this_layer
             layer += 1
+            
+        return last_y_center # Return the innermost boundary for torsion bar placement
 
     # 3. Draw Main Tension Bars (Bottom - Red)
-    draw_bar_layers(reinf.main_bars, is_top=False)
+    inner_bottom_y = draw_bar_layers(reinf.main_bars, is_top=False)
+    if inner_bottom_y == 0: inner_bottom_y = yb + (cover + d_tie + 20) * scale
     
     # 4. Draw Compression Bars (Top - Green)
-    draw_bar_layers(reinf.compression_bars, is_top=True)
+    inner_top_y = draw_bar_layers(reinf.compression_bars, is_top=True)
+    if inner_top_y == 0: inner_top_y = yt - (cover + d_tie + 20) * scale
+
+    # 5. Draw Torsion Longitudinal Bars (Sides - Orange)
+    if reinf.torsion_required and reinf.torsion_longitudinal_area > 0:
+        # Assume D16 bars for side skin reinforcement visualization (Area approx 201 mm²)
+        d_tbar = 16
+        a_tbar = 201.06
+        # Distribute Al to the two vertical side faces
+        num_side_bars_total = max(2, math.ceil(reinf.torsion_longitudinal_area / a_tbar))
+        if num_side_bars_total % 2 != 0: 
+            num_side_bars_total += 1 # Ensure symmetry
+            
+        num_per_side = num_side_bars_total // 2
+        
+        # Prevent extreme visual clutter if Al is massively huge
+        num_per_side = min(num_per_side, 8) 
+        
+        r_tbar = (d_tbar / 2) * scale
+        x_left = xl + (cover + d_tie + d_tbar / 2) * scale
+        x_right = xr - (cover + d_tie + d_tbar / 2) * scale
+        
+        # Space them evenly between the flexural layers
+        if num_per_side > 0:
+            step_y = (inner_top_y - inner_bottom_y) / (num_per_side + 1)
+            for i in range(1, num_per_side + 1):
+                y_pos = inner_bottom_y + i * step_y
+                graph.draw_circle((x_left, y_pos), r_tbar, fill_color='darkorange', line_color='black')
+                graph.draw_circle((x_right, y_pos), r_tbar, fill_color='darkorange', line_color='black')
 
 
 def create_gui():
@@ -125,7 +158,7 @@ def create_gui():
         [sg.Text('Mu (kN⋅m):', size=(12, 1)), sg.Input('200', key='-MU-', size=(8, 1)),
          sg.Text('Vu (kN):', size=(8, 1)), sg.Input('200', key='-VU-', size=(8, 1))],
         [sg.Text('Srv. Mu (kN⋅m):', size=(12, 1)), sg.Input('300', key='-SMU-', size=(8, 1)),
-         sg.Text('Tu (kN⋅m):', size=(8, 1)), sg.Input('0', key='-TU-', size=(8, 1))],
+         sg.Text('Tu (kN⋅m):', size=(8, 1)), sg.Input('35', key='-TU-', size=(8, 1))], # Defaulted Tu to 35 to show off torsion
         [sg.Text('Grav. Shear (kN):', size=(12, 1)), sg.Input('100', key='-GSHEAR-', size=(8, 1))]
     ])
 
@@ -139,7 +172,7 @@ def create_gui():
 
     # --- RIGHT COLUMN (Outputs & Visualization) ---
     output_frame = sg.Frame('Results & Reinforcement', [
-        [sg.Multiline(size=(55, 13), key='-OUTPUT-', disabled=True, font='Courier 10')]
+        [sg.Multiline(size=(55, 14), key='-OUTPUT-', disabled=True, font='Courier 10')]
     ])
 
     graph_elem = sg.Graph(
@@ -152,9 +185,10 @@ def create_gui():
 
     visual_frame = sg.Frame('Cross-Section Visualization', [
         [graph_elem],
-        [sg.Text("■ Tension (Bottom)", text_color='red', background_color='white'),
-         sg.Text("■ Compression (Top)", text_color='darkgreen', background_color='white'),
-         sg.Text("■ Stirrups", text_color='blue', background_color='white')]
+        [sg.Text("■ Tension (Bot)", text_color='red', background_color='white'),
+         sg.Text("■ Comp. (Top)", text_color='darkgreen', background_color='white'),
+         sg.Text("■ Stirrups", text_color='blue', background_color='white'),
+         sg.Text("■ Torsion (Sides)", text_color='darkorange', background_color='white')]
     ], background_color='white')
 
     right_column = [
@@ -164,7 +198,7 @@ def create_gui():
 
     # --- MAIN LAYOUT ---
     layout = [
-        [sg.Text('ACI 318M-25 Beam Designer', font=('Helvetica', 16, 'bold'))],
+        [sg.Text('ACI 318M-25 Beam Designer (Flexure, Shear, Torsion, Seismic)', font=('Helvetica', 14, 'bold'))],
         [sg.Column(left_column, vertical_alignment='top'), sg.Column(right_column, vertical_alignment='top')]
     ]
 
@@ -226,19 +260,24 @@ def create_gui():
                 else:
                     output_text += "Compression Bars:    None required\n"
                 
-                output_text += f"\n=== SHEAR & SEISMIC DETAILING ===\n"
+                output_text += f"\n=== SHEAR, TORSION & SEISMIC ===\n"
                 output_text += f"Stirrup Size:        {reinf.stirrups}\n"
                 if beam.frame_system == FrameSystem.SPECIAL:
                     output_text += f"Hinge Zone Spacing:  {reinf.stirrup_spacing_hinge:.0f} mm (len: {reinf.hinge_length:.0f} mm)\n"
                     output_text += f"Mid-Span Spacing:    {reinf.stirrup_spacing:.0f} mm\n"
                 else:
                     output_text += f"Stirrup Spacing:     {reinf.stirrup_spacing:.0f} mm\n"
+                
+                if reinf.torsion_required:
+                    output_text += f"Torsion Long. Steel: {reinf.torsion_longitudinal_area:.1f} mm² (Al distributed)\n"
 
                 output_text += "\n=== DESIGN CAPACITIES ===\n"
                 output_text += f"Demand/Capacity:     {results.utilization_ratio:.2f} (Max)\n"
                 output_text += f"Moment Capacity:     {results.moment_capacity:.1f} kN⋅m\n"
                 output_text += f"Probable Moment:     {results.probable_moment:.1f} kN⋅m\n"
                 output_text += f"Design Shear Ve:     {results.capacity_shear_ve:.1f} kN\n"
+                if reinf.torsion_required:
+                    output_text += f"Torsion Capacity Tn: {results.torsion_capacity:.1f} kN⋅m\n"
 
                 output_text += "\n=== DESIGN NOTES & WARNINGS ===\n"
                 if results.design_notes:

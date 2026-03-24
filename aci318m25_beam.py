@@ -13,7 +13,7 @@ Based on:
 
 @author: Enhanced by AI Assistant  
 @date: 2024
-@version: 1.3 (Seismic Integrity & Strict 2-Layer Limit)
+@version: 1.4 (Combined Shear-Torsion & Seismic Update)
 """
 
 import math
@@ -125,79 +125,79 @@ class ACI318M25BeamDesign:
         }
         
     def check_seismic_geometric_limits(self, geometry: BeamGeometry) -> List[str]:
-        """
-        Check dimensional limits for Special Moment Frame (SMF) beams
-        ACI 318M-25 Section 18.6.2
-        """
+        """Check dimensional limits for Special Moment Frame (SMF) beams"""
         warnings = []
-        
         if geometry.frame_system == FrameSystem.SPECIAL:
-            # 1. Clear span to effective depth ratio
             if geometry.clear_span > 0:
                 span_ratio = geometry.clear_span / geometry.effective_depth
                 if span_ratio < 4.0:
                     warnings.append(f"SMF Violation: Clear span to depth ratio ({span_ratio:.1f}) must be >= 4.0.")
-            
-            # 2. Minimum width
             if geometry.width < 250.0:
                 warnings.append(f"SMF Violation: Beam width ({geometry.width:.0f} mm) must be >= 250 mm.")
-                
-            # 3. Width to depth ratio
             aspect_ratio = geometry.width / geometry.height
             if aspect_ratio < 0.3:
                 warnings.append(f"SMF Violation: Beam width to overall depth ratio ({aspect_ratio:.2f}) must be >= 0.3.")
-                
         return warnings
 
-    def calculate_probable_moment_capacity(self, As: float, As_prime: float,
-                                         beam_geometry: BeamGeometry,
-                                         material_props: MaterialProperties) -> float:
-        """
-        Calculate probable flexural strength (Mpr) for SMF capacity design.
-        ACI 318M-25 Section 18.6.5
-        Uses steel stress of 1.25fy and strength reduction factor phi = 1.0.
-        """
+    def _calculate_torsional_properties(self, beam_geometry: BeamGeometry, stirrup_size: str = 'D10') -> Dict[str, float]:
+        """Calculate cross-sectional properties for torsion (ACI 318M-25 Chapter 22)"""
+        bw = beam_geometry.width
+        h = beam_geometry.height
+        cover = beam_geometry.cover
+        db_stirrup = self.aci.get_bar_diameter(stirrup_size)
+        
+        Acp = bw * h
+        pcp = 2 * (bw + h)
+        
+        x1 = bw - 2 * cover - db_stirrup
+        y1 = h - 2 * cover - db_stirrup
+        
+        if x1 <= 0 or y1 <= 0:
+            raise ValueError("Beam dimensions too small for the specified cover and stirrups.")
+            
+        Aoh = x1 * y1
+        ph = 2 * (x1 + y1)
+        Ao = 0.85 * Aoh
+        
+        return {'Acp': Acp, 'pcp': pcp, 'Aoh': Aoh, 'ph': ph, 'Ao': Ao}
+
+    def check_torsion_requirement(self, tu: float, beam_geometry: BeamGeometry, material_props: MaterialProperties) -> bool:
+        """Check if torsion design is required (Tu > φTth)"""
+        if tu <= 0.0:
+            return False
         fc_prime = material_props.fc_prime
-        fy_pr = 1.25 * material_props.fy  # Probable yield strength
+        phi_t = self.phi_factors['torsion']
+        props = self._calculate_torsional_properties(beam_geometry)
+        Tth = 0.083 * math.sqrt(fc_prime) * (props['Acp']**2 / props['pcp']) / 1e6 # kN⋅m
+        return tu > (phi_t * Tth)
+
+    def calculate_probable_moment_capacity(self, As: float, As_prime: float, beam_geometry: BeamGeometry, material_props: MaterialProperties) -> float:
+        """Calculate probable flexural strength (Mpr) for SMF capacity design using 1.25fy"""
+        fc_prime = material_props.fc_prime
+        fy_pr = 1.25 * material_props.fy
         b = beam_geometry.width
         d = beam_geometry.effective_depth
         d_prime = beam_geometry.cover + 20.0
         
-        # Determine compression block depth (a) considering both tension and compression steel yielding
         a = (As * fy_pr - As_prime * fy_pr) / (0.85 * fc_prime * b)
-        a = max(0.01, a)  # Defensive limit
+        a = max(0.01, a)
         
         Mpr = (As * fy_pr * (d - a/2) + As_prime * fy_pr * (a/2 - d_prime)) / 1e6
         return max(0.0, Mpr)
 
     def calculate_minimum_reinforcement_ratio(self, fc_prime: float, fy: float) -> float:
-        """Calculate minimum reinforcement ratio - ACI 318M-25 Section 9.6.1"""
         rho_min_basic = 1.4 / fy
         rho_min_alt = 0.25 * math.sqrt(fc_prime) / fy
         return max(rho_min_basic, rho_min_alt)
     
-    def calculate_maximum_reinforcement_ratio(self, fc_prime: float, fy: float,
-                                            beam_geometry: BeamGeometry) -> float:
-        """
-        Calculate maximum reinforcement ratio
-        ACI 318M-25 Section 21.2.2 and Chapter 18
-        """
+    def calculate_maximum_reinforcement_ratio(self, fc_prime: float, fy: float, beam_geometry: BeamGeometry) -> float:
         beta1 = self._calculate_beta1(fc_prime)
-        
-        # Standard tension-controlled max ratio
         rho_max = 3/8 * 0.85 * fc_prime * beta1 / fy
-        
-        # Seismic limit for Special Moment Frames
         if beam_geometry.frame_system == FrameSystem.SPECIAL:
             rho_max = min(rho_max, 0.025)
-            
         return rho_max
     
-    def design_flexural_reinforcement(self, mu: float, beam_geometry: BeamGeometry,
-                                    material_props: MaterialProperties) -> Tuple[ReinforcementDesign, List[str]]:
-        """
-        Design flexural reinforcement for rectangular or T-beam sections
-        """
+    def design_flexural_reinforcement(self, mu: float, beam_geometry: BeamGeometry, material_props: MaterialProperties) -> Tuple[ReinforcementDesign, List[str]]:
         notes = []
         fc_prime = material_props.fc_prime
         fy = material_props.fy
@@ -208,7 +208,6 @@ class ACI318M25BeamDesign:
         
         rho_max = self.calculate_maximum_reinforcement_ratio(fc_prime, fy, beam_geometry)
         As_max = rho_max * b * d
-        
         a_max = As_max * fy / (0.85 * fc_prime * b)
         Mn_max = As_max * fy * (d - a_max / 2)
         phi_Mn_max = phi * Mn_max
@@ -219,27 +218,20 @@ class ACI318M25BeamDesign:
             design = self._design_doubly_reinforced_section(Mu, beam_geometry, material_props)
             notes.append("Compression reinforcement was required to satisfy flexural demand/ductility.")
             
-        # Seismic Detailing & Integrity Checks
         if beam_geometry.frame_system == FrameSystem.SPECIAL:
             notes.append("SMF Detailing: Ensure at least two continuous bars are provided at both top and bottom faces (ACI 18.6.3.1).")
-            notes.append("SMF Detailing: Lap splices must not be located within joints, within 2h from joint faces, or where flexural yielding is likely (ACI 18.6.3.3).")
+            notes.append("SMF Detailing: Lap splices must not be located within joints, within 2h from joint faces, or where flexural yielding is likely.")
             
-            # Integrity Check: Opposite face reinforcement must provide at least 50% of the primary face capacity (ACI 18.6.3.2)
             mn_primary = self._calculate_moment_capacity(design.main_area, beam_geometry, material_props)
             required_mn_secondary = 0.5 * mn_primary
-            
             mn_provided_secondary = self._calculate_moment_capacity(design.compression_area, beam_geometry, material_props) if design.compression_area > 0 else 0.0
             
             if mn_provided_secondary < required_mn_secondary:
-                # Approximate the required area to meet the 50% moment rule
                 as_secondary_req = (required_mn_secondary * 1e6) / (fy * 0.9 * beam_geometry.effective_depth)
-                
-                # Check against absolute minimum steel limits
                 rho_min = self.calculate_minimum_reinforcement_ratio(material_props.fc_prime, fy)
                 as_min = rho_min * beam_geometry.width * beam_geometry.effective_depth
                 
                 as_secondary_req = max(as_secondary_req, as_min)
-                
                 design.compression_area = as_secondary_req
                 design.compression_bars = self._select_reinforcement_bars(design.compression_area, beam_geometry, fy, stirrup_size='D10')
                 notes.append(f"SMF Integrity: Opposite face reinforcement increased to {design.compression_area:.1f} mm² to provide >= 50% of primary moment capacity (Mn+ >= 0.5 Mn-).")
@@ -248,8 +240,7 @@ class ACI318M25BeamDesign:
                 
         return design, notes
     
-    def _design_tension_reinforcement_only(self, Mu: float, beam_geometry: BeamGeometry,
-                                         material_props: MaterialProperties) -> ReinforcementDesign:
+    def _design_tension_reinforcement_only(self, Mu: float, beam_geometry: BeamGeometry, material_props: MaterialProperties) -> ReinforcementDesign:
         fc_prime = material_props.fc_prime
         fy = material_props.fy
         b = beam_geometry.width
@@ -273,14 +264,11 @@ class ACI318M25BeamDesign:
         ld = self.aci.calculate_development_length(main_bar_size, fc_prime, fy)
         
         return ReinforcementDesign(
-            main_bars=main_bars, main_area=As_required,
-            compression_bars=[], compression_area=0.0,
-            stirrups='D10', stirrup_spacing=200.0,
-            development_length=ld
+            main_bars=main_bars, main_area=As_required, compression_bars=[], compression_area=0.0,
+            stirrups='D10', stirrup_spacing=200.0, development_length=ld
         )
     
-    def _design_doubly_reinforced_section(self, Mu: float, beam_geometry: BeamGeometry,
-                                        material_props: MaterialProperties) -> ReinforcementDesign:
+    def _design_doubly_reinforced_section(self, Mu: float, beam_geometry: BeamGeometry, material_props: MaterialProperties) -> ReinforcementDesign:
         fc_prime = material_props.fc_prime
         fy = material_props.fy
         es = material_props.es
@@ -315,61 +303,106 @@ class ACI318M25BeamDesign:
         ld = self.aci.calculate_development_length(main_bar_size, fc_prime, fy)
         
         return ReinforcementDesign(
-            main_bars=main_bars, main_area=As_total,
-            compression_bars=comp_bars, compression_area=As2_prime,
-            stirrups='D10', stirrup_spacing=150.0,
-            development_length=ld
+            main_bars=main_bars, main_area=As_total, compression_bars=comp_bars, compression_area=As2_prime,
+            stirrups='D10', stirrup_spacing=150.0, development_length=ld
         )
     
-    def design_shear_reinforcement(self, vu: float, mpr: float, gravity_shear: float,
-                                 beam_geometry: BeamGeometry, material_props: MaterialProperties,
-                                 main_reinforcement: ReinforcementDesign) -> Tuple[str, float, float, float, List[str]]:
+    def design_transverse_reinforcement(self, vu: float, tu: float, mpr: float, gravity_shear: float,
+                                        beam_geometry: BeamGeometry, material_props: MaterialProperties,
+                                        main_reinforcement: ReinforcementDesign) -> Tuple[str, float, float, float, float, float, List[str]]:
         """
-        Design shear reinforcement evaluating capacity design provisions
-        Returns: (stirrup_size, s_hinge, s_span, Ve, design_notes)
+        Design transverse reinforcement for combined shear, torsion, and seismic capacity provisions.
+        Returns: (stirrup_size, s_hinge, s_span, Ve_design, Al_req, Tn, design_notes)
         """
         notes = []
         fc_prime = material_props.fc_prime
         fy = material_props.fy
-        b = beam_geometry.width
+        fyt = material_props.fy # Assume transverse yield matches main yield
+        bw = beam_geometry.width
         d = beam_geometry.effective_depth
         phi_v = self.phi_factors['shear']
+        phi_t = self.phi_factors['torsion']
         
-        # Establish Design Shear (Ve)
-        Vu = vu * 1000  # Default factored statics shear (N)
+        # 1. Establish Design Shear (Ve)
+        Vu = vu * 1000  # N
+        Tu = tu * 1e6   # N-mm
         Ve = Vu
         
         if beam_geometry.frame_system == FrameSystem.SPECIAL and beam_geometry.clear_span > 0:
             V_seismic = (2 * mpr * 1e6) / beam_geometry.clear_span
             Ve = (gravity_shear * 1000) + V_seismic
-            Ve = max(Ve, Vu) # Take the envelope of statics vs capacity design
+            Ve = max(Ve, Vu)
             notes.append(f"SMF Capacity Design: Seismic design shear Ve = {Ve/1000:.1f} kN (Governed by Mpr = {mpr:.1f} kN-m).")
         
-        # Evaluate Concrete Contribution (Vc)
-        Vc = 0.17 * math.sqrt(fc_prime) * b * d
+        # 2. Evaluate Concrete Shear Contribution (Vc)
+        Vc = 0.17 * math.sqrt(fc_prime) * bw * d
         if beam_geometry.frame_system == FrameSystem.SPECIAL:
             V_seismic_only = Ve - (gravity_shear * 1000)
             if V_seismic_only > 0.5 * Ve:
                 Vc = 0.0
                 notes.append("SMF Detailing: Vc taken as 0 per ACI 18.6.5.2 (Seismic shear > 0.5Ve).")
         
-        phi_Vc = phi_v * Vc
-        Vs_req = max(0.0, (Ve / phi_v) - Vc)
+        # 3. Check Torsion
+        torsion_required = self.check_torsion_requirement(tu, beam_geometry, material_props)
+        props = self._calculate_torsional_properties(beam_geometry)
         
-        # Initial Stirrup Sizing
+        Al_req = 0.0
+        Tn = 0.0
         stirrup_size = 'D10'
-        Av = 2 * self.aci.get_bar_area(stirrup_size)
+        Av_total_over_s = 0.0
         
-        # Calculate theoretical spacing for required shear
-        if Vs_req > 0:
-            s_req = Av * fy * d / Vs_req
-        else:
-            s_req = float('inf')
+        if torsion_required:
+            notes.append("Torsion demand exceeds threshold. Combined shear-torsion design applied.")
             
-        # Determine Spacing Limits - ACI 318M-25 Section 9.7.6.2.2 & 18.6.4
-        Vs_threshold = 0.33 * math.sqrt(fc_prime) * b * d
-        s_span_max = min(d / 4, 300.0) if Vs_req > Vs_threshold else min(d / 2, 600.0)
+            # Cross-sectional Adequacy Check (Interaction)
+            shear_stress = Ve / (bw * d)
+            torsion_stress = (Tu * props['ph']) / (1.7 * props['Aoh']**2)
+            combined_stress = math.sqrt(shear_stress**2 + torsion_stress**2)
+            
+            # Vc nominal for adequacy limit uses full Vc equation, ignoring seismic Vc=0 rule
+            Vc_nom = 0.17 * math.sqrt(fc_prime) * bw * d
+            stress_limit = phi_v * ((Vc_nom / (bw * d)) + 0.66 * math.sqrt(fc_prime))
+            
+            if combined_stress > stress_limit:
+                raise ValueError(f"Cross-section inadequate for combined shear and torsion. Increase section dimensions. (Demand: {combined_stress:.2f} MPa, Limit: {stress_limit:.2f} MPa)")
+
+            # Transverse Steel Required for Shear and Torsion
+            Vs_req = max(0.0, (Ve / phi_v) - Vc)
+            Av_over_s = Vs_req / (fyt * d) # mm^2/mm (2 legs assumed for shear part)
+            
+            theta = math.radians(45)
+            At_over_s = Tu / (phi_t * 2 * props['Ao'] * fyt * (1 / math.tan(theta))) # mm^2/mm (per leg)
+            
+            # Total required transverse reinforcement per mm (A_{v+t} / s)
+            Av_total_over_s = Av_over_s + 2 * At_over_s
+            
+            # Minimum transverse
+            min_transverse = max(0.062 * math.sqrt(fc_prime) * bw / fyt, 0.35 * bw / fyt)
+            Av_total_over_s = max(Av_total_over_s, min_transverse)
+            
+            # Longitudinal Torsion Steel (Al)
+            Al_req = At_over_s * props['ph'] * (fyt / fy) * (1 / math.tan(theta))**2
+            At_over_s_min = max(At_over_s, 0.175 * bw / fyt)
+            Al_min = (0.42 * math.sqrt(fc_prime) * props['Acp'] / fy) - (At_over_s_min * props['ph'] * (fyt / fy))
+            Al_req = max(Al_req, Al_min, 0.0)
+            notes.append(f"Torsion: Distribute Al = {Al_req:.1f} mm² of additional longitudinal steel around the section perimeter.")
+            
+        else:
+            Vs_req = max(0.0, (Ve / phi_v) - Vc)
+            Av_total_over_s = Vs_req / (fyt * d)
+            
+        # 4. Spacing Calculation & Limits
+        Av_stirrup = 2 * self.aci.get_bar_area(stirrup_size) # 2 legs of closed hoop
+        s_req = Av_stirrup / Av_total_over_s if Av_total_over_s > 0 else float('inf')
         
+        Vs_threshold = 0.33 * math.sqrt(fc_prime) * bw * d
+        Vs_actual = Ve / phi_v - Vc
+        s_span_max = min(d / 4, 300.0) if Vs_actual > Vs_threshold else min(d / 2, 600.0)
+        
+        if torsion_required:
+            s_span_max = min(s_span_max, props['ph'] / 8, 300.0)
+            notes.append("Torsion dictates use of closed hoops with seismic hooks.")
+            
         db_long = self.aci.get_bar_diameter(main_reinforcement.main_bars[0]) if main_reinforcement.main_bars else 20.0
         
         if beam_geometry.frame_system == FrameSystem.SPECIAL:
@@ -377,7 +410,7 @@ class ACI318M25BeamDesign:
             s_span_max = min(s_span_max, d / 2) # Strict limit for SMF span
             notes.append(f"SMF Detailing: First hoop must be placed <= 50 mm from support face.")
         else:
-            s_hinge_max = s_span_max # No special hinge zone for ordinary frames
+            s_hinge_max = s_span_max 
             
         s_hinge_actual = math.floor(min(s_req, s_hinge_max) / 10) * 10
         s_span_actual = math.floor(min(s_req, s_span_max) / 10) * 10
@@ -385,13 +418,19 @@ class ACI318M25BeamDesign:
         # Enforce absolute minimum spacing constructability
         if s_hinge_actual < 75.0:
             stirrup_size = 'D12'
-            Av = 2 * self.aci.get_bar_area(stirrup_size)
-            s_req = Av * fy * d / Vs_req if Vs_req > 0 else float('inf')
+            Av_stirrup = 2 * self.aci.get_bar_area(stirrup_size)
+            s_req = Av_stirrup / Av_total_over_s if Av_total_over_s > 0 else float('inf')
             s_hinge_actual = math.floor(min(s_req, s_hinge_max) / 10) * 10
             s_span_actual = math.floor(min(s_req, s_span_max) / 10) * 10
             notes.append(f"Stirrup size increased to {stirrup_size} to satisfy minimum 75mm clear spacing.")
 
-        return stirrup_size, s_hinge_actual, s_span_actual, Ve / 1000, notes
+        # Recalculate provided Tn based on actual spacing in span (conservative)
+        if torsion_required and s_span_actual > 0:
+            At_prov = self.aci.get_bar_area(stirrup_size) # 1 leg
+            Tn = 2 * props['Ao'] * At_prov * fyt * (1 / math.tan(math.radians(45))) / s_span_actual
+            Tn = Tn / 1e6 # kN-m
+
+        return stirrup_size, max(s_hinge_actual, 50.0), max(s_span_actual, 50.0), Ve / 1000, Al_req, Tn, notes
     
     def perform_complete_beam_design(self, mu: float, vu: float, beam_geometry: BeamGeometry,
                                    material_props: MaterialProperties,
@@ -399,7 +438,7 @@ class ACI318M25BeamDesign:
                                    tu: float = 0.0,
                                    gravity_shear: float = 0.0) -> BeamAnalysisResult:
         """
-        Perform complete beam design analysis including Seismic Capacity Design (Ve, Mpr)
+        Perform complete beam design analysis including Seismic Capacity Design and Combined Shear-Torsion
         """
         design_notes = []
         
@@ -419,37 +458,37 @@ class ACI318M25BeamDesign:
                 beam_geometry, material_props
             )
             
-        # 3. Shear & Capacity Design
-        gravity_v = gravity_shear if gravity_shear > 0 else vu * 0.5 # Approximation if not provided
+        # 3. Transverse Design (Combined Shear & Torsion & Seismic)
+        gravity_v = gravity_shear if gravity_shear > 0 else vu * 0.5 
         if beam_geometry.clear_span <= 0 and beam_geometry.frame_system == FrameSystem.SPECIAL:
             design_notes.append("WARNING: clear_span not provided. Capacity Shear (Ve) cannot be calculated accurately.")
             
-        stirrup_size, s_hinge, s_span, ve_design, shear_notes = self.design_shear_reinforcement(
-            vu, mpr, gravity_v, beam_geometry, material_props, flexural_design
+        stirrup_size, s_hinge, s_span, ve_design, al_req, tn_cap, trans_notes = self.design_transverse_reinforcement(
+            vu, tu, mpr, gravity_v, beam_geometry, material_props, flexural_design
         )
-        design_notes.extend(shear_notes)
+        design_notes.extend(trans_notes)
         
-        # Assign shear results back to the reinforcement object
+        # Assign transverse results back to the reinforcement object
         flexural_design.stirrups = stirrup_size
         flexural_design.stirrup_spacing_hinge = s_hinge
         flexural_design.stirrup_spacing = s_span
         flexural_design.hinge_length = 2 * beam_geometry.height if beam_geometry.frame_system == FrameSystem.SPECIAL else 0.0
-        
-        # 4. Torsion (Simplified Bypass Check)
-        if tu > 0:
-            design_notes.append("Note: Torsion detected. Advanced combined shear-torsion iteration omitted in capacity design wrapper.")
+        flexural_design.torsion_required = al_req > 0
+        flexural_design.torsion_longitudinal_area = al_req
 
-        # 5. Calculate capacities for Demand/Capacity ratio
+        # 4. Calculate capacities for Demand/Capacity ratio
         phi_m = self.phi_factors['flexure_tension_controlled']
         phi_v = self.phi_factors['shear']
+        phi_t = self.phi_factors['torsion']
         
         moment_capacity = self._calculate_moment_capacity(flexural_design.main_area, beam_geometry, material_props)
         shear_capacity = self._calculate_shear_capacity(beam_geometry, material_props, stirrup_size, s_hinge)
         
         utilization_moment = mu / (phi_m * moment_capacity) if moment_capacity > 0 else 1.0
         utilization_shear = ve_design / (phi_v * shear_capacity) if shear_capacity > 0 else 1.0
+        utilization_torsion = tu / (phi_t * tn_cap) if tn_cap > 0 else 0.0
         
-        # 6. Deflection Calculation
+        # 5. Deflection Calculation
         deflection = 0.0
         if service_moment:
             L = beam_geometry.length
@@ -462,11 +501,11 @@ class ACI318M25BeamDesign:
             probable_moment=mpr,
             shear_capacity=shear_capacity,
             capacity_shear_ve=ve_design,
-            torsion_capacity=0.0,
+            torsion_capacity=tn_cap,
             deflection=deflection,
             crack_width=0.0,
             reinforcement=flexural_design,
-            utilization_ratio=max(utilization_moment, utilization_shear),
+            utilization_ratio=max(utilization_moment, utilization_shear, utilization_torsion),
             design_notes=design_notes
         )
 
@@ -508,7 +547,6 @@ class ACI318M25BeamDesign:
         bar_data = [('D16', 201.06), ('D20', 314.16), ('D25', 490.87), 
                     ('D28', 615.75), ('D32', 804.25), ('D36', 1017.88)]
         
-        # Calculate available clear width between stirrup legs
         d_tie = self.aci.get_bar_diameter(stirrup_size)
         cc = beam_geometry.cover
         available_width = beam_geometry.width - 2 * cc - 2 * d_tie
@@ -517,23 +555,17 @@ class ACI318M25BeamDesign:
             num_bars = max(2, math.ceil(As_required / area))
             db = self.aci.get_bar_diameter(bar_size)
             
-            # Minimum clear spacing per ACI 318M-25 Section 25.2.1
             min_clear_spacing = max(25.0, db, (4.0/3.0) * aggregate_size)
-            
-            # Calculate max bars that can fit linearly in a single layer
             max_bars_per_layer = math.floor((available_width + min_clear_spacing) / (db + min_clear_spacing))
             
             if max_bars_per_layer < 2:
-                continue # The beam is too narrow even for 2 bars of this size, move to the next size
+                continue 
                 
             num_layers = math.ceil(num_bars / max_bars_per_layer)
             
-            # Practical placement limit: try not to exceed 2 layers. 
-            # If we do, we move to a larger bar size to reduce the total number of bars.
             if num_layers <= 2:
                 return [bar_size] * num_bars
                 
-        # Final Fallback if nothing fits nicely within 2 layers
         largest_bar, largest_area = bar_data[-1]
         num_largest = max(2, math.ceil(As_required / largest_area))
         return [largest_bar] * num_largest
